@@ -98,6 +98,18 @@ def _norm_text(s: str) -> str:
     return t
 
 
+def sheet_a1(tab_name: str) -> str:
+    """Return a sheet name safe for A1 notation (quotes when needed)."""
+    t = str(tab_name or "").strip()
+    if t == "":
+        return t
+    # quote if contains spaces or special chars
+    if re.search(r"[\s\(\)\[\]\!\:\'\"]", t):
+        t = t.replace("'", "''")
+        return f"'{t}'"
+    return t
+
+
 # ====== yfinance helpers ======
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def hist_one(ticker: str) -> pd.DataFrame:
@@ -568,18 +580,24 @@ def _a1(col: int, row: int) -> str:
     return f"{col_letters}{row}"
 
 
+
 def find_stock_rows_from_sheet(grid: List[List[Any]]) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
     """
-    Scan a 2D grid (rows x cols) and find:
-    - tw_header row contains "台股" and "台幣"
-    - hk_header row contains "港股" and "港幣"
-    Then parse codes from column A under each section.
+    Scan a 2D grid (rows x cols) and find TW/HK sections, then extract codes from column A.
 
-    Supports header order reversed.
+    Why this version:
+    - In Google Sheet, column A might be "2926-誠品生活" (not pure digits). We extract leading digits.
+    - Header might be in any column, and may include spaces/line breaks.
+    - Works even if header order is reversed.
+
+    Returns:
+      tw_rows: [(row_index_1based, "2926"), ...]
+      hk_rows: [(row_index_1based, "0005"), ...]  (4-digit)
     """
     tw_header = None
     hk_header = None
 
+    # --- locate headers anywhere in the row ---
     for i, row in enumerate(grid, start=1):
         joined = _norm_text("".join(str(c) for c in row if c is not None))
         if tw_header is None and ("台股" in joined and "台幣" in joined):
@@ -588,53 +606,71 @@ def find_stock_rows_from_sheet(grid: List[List[Any]]) -> Tuple[List[Tuple[int, s
             hk_header = i
 
     if tw_header is None or hk_header is None:
-        # provide a quick preview for debugging
         preview_lines = []
-        for r in range(1, min(41, len(grid) + 1)):
+        for r in range(1, min(61, len(grid) + 1)):
             row = grid[r - 1] if r - 1 < len(grid) else []
-            preview_lines.append(f"{r:03d}: " + " | ".join(str(x) for x in (row[:6] if row else [])))
+            preview_lines.append(f"{r:03d}: " + " | ".join(str(x) for x in (row[:8] if row else [])))
         raise RuntimeError(
-            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。\n"
+            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。
+"
             + "\n".join(preview_lines)
         )
 
-    def _read_codes_down(start_row: int, stop_row: Optional[int]) -> List[Tuple[int, str]]:
+    def _extract_tw_code(a_val: str) -> Optional[str]:
+        s = str(a_val or "").strip()
+        # accept: "2926", "2926.TW", "2926-誠品生活", "2926 誠品生活"
+        m = re.match(r"^(\d{4,6})", s)
+        return m.group(1) if m else None
+
+    def _extract_hk_code(a_val: str) -> Optional[str]:
+        s = str(a_val or "").strip()
+        s = s.replace(".HK", "").replace("HK", "").strip()
+        m = re.match(r"^(\d{1,5})", s)  # HK codes can be 1-5 digits; we'll zfill(4)
+        return m.group(1).zfill(4) if m else None
+
+    def _read_codes_down(start_row: int, stop_row: Optional[int], kind: str) -> List[Tuple[int, str]]:
         out: List[Tuple[int, str]] = []
         r = start_row
+        blanks = 0
         while True:
             if stop_row is not None and r >= stop_row:
                 break
             if r > len(grid):
                 break
+
             a_val = ""
             try:
                 a_val = str(grid[r - 1][0]).strip() if len(grid[r - 1]) > 0 else ""
             except Exception:
                 a_val = ""
+
             if a_val == "" or a_val.lower() == "none":
-                break
-            code = a_val.replace(".HK", "").replace("HK", "").strip()
-            # accept digits only for TW, but for safety allow numeric-looking
-            out.append((r, code))
+                blanks += 1
+                if blanks >= 3:
+                    break
+                r += 1
+                continue
+            blanks = 0
+
+            if kind == "tw":
+                code = _extract_tw_code(a_val)
+            else:
+                code = _extract_hk_code(a_val)
+
+            if code:
+                out.append((r, code))
             r += 1
         return out
 
-    tw_rows: List[Tuple[int, str]]
-    hk_rows: List[Tuple[int, str]]
-
     if tw_header < hk_header:
-        tw_rows = _read_codes_down(tw_header + 1, hk_header)
-        hk_rows = _read_codes_down(hk_header + 1, None)
+        tw_rows = _read_codes_down(tw_header + 1, hk_header, "tw")
+        hk_rows = _read_codes_down(hk_header + 1, None, "hk")
     else:
-        hk_rows = _read_codes_down(hk_header + 1, tw_header)
-        tw_rows = _read_codes_down(tw_header + 1, None)
-
-    # TW: keep only pure digits (4-digit codes etc)
-    tw_rows = [(r, c) for (r, c) in tw_rows if str(c).strip().isdigit()]
-    # HK: normalize to 4 digits
-    hk_rows = [(r, str(c).strip().replace(".HK", "").zfill(4)) for (r, c) in hk_rows if str(c).strip()]
+        hk_rows = _read_codes_down(hk_header + 1, tw_header, "hk")
+        tw_rows = _read_codes_down(tw_header + 1, None, "tw")
 
     return tw_rows, hk_rows
+
 
 
 # ====== Main ======
@@ -648,7 +684,8 @@ def main():
 
     # Read a block for scanning and codes from column A
     # Use A1:Z300 to be safe with headers not strictly in B.
-    rng_grid = f"{tab}!A1:Z300"
+    tab_a1 = sheet_a1(tab)
+    rng_grid = f"{tab_a1}!A1:Z300"
     grid = sheet_values_get(svc, gsheet_id, rng_grid)
 
     tw_rows, hk_rows = find_stock_rows_from_sheet(grid)
@@ -688,7 +725,7 @@ def main():
     updates: List[Dict[str, Any]] = []
 
     def put(a1: str, value):
-        updates.append({"range": f"{tab}!{a1}", "values": [[value]]})
+        updates.append({"range": f"{tab_a1}!{a1}", "values": [[value]]})
 
     # timestamp
     put("L3", now.strftime("%Y-%m-%d %H:%M:%S"))
