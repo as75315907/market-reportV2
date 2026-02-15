@@ -34,13 +34,21 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
+      - name: Check SMTP env exists (no secrets printed)
+        run: |
+          python - <<'PY'
+          import os
+          keys = ["SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_APP_PASSWORD","MAIL_TO"]
+          for k in keys:
+            v = os.getenv(k)
+            print(k, "OK" if (v and v.strip()) else "MISSING")
+          PY
       - name: Run report
         run: |
           rm -f tw_suffix_cache.json
