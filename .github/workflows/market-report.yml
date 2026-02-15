@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Taipei
-      DEBUG_HKEX: "0"
+      DEBUG_HKEX: "1"
       OUTPUT_DIR: "reports"
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
