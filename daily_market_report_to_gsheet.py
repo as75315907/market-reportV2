@@ -591,6 +591,19 @@ def main():
             "volume": _last("Volume"),
         }
         time.sleep(0.2)
+    # ===== HK Turnover: shift-right with first-run fallback =====
+    # 你清空 D/E/H/I/J/K 時，第一次跑 H8 一定是空 -> 直接用 hk_prev_yi 當 prev
+    old_h8 = get_values(svc, sheet_id, f"{tab_q}!H8")
+    old_h8_val = None
+    if old_h8 and old_h8[0]:
+        old_h8_val = _to_float(old_h8[0][0])
+    
+    # 判斷是否「第一次跑」（或 H8 被清空）
+    is_first_run_hk = (old_h8_val is None)
+    
+    # 右移：正常情況 prev = 舊的 today
+    # 第一次跑：prev = hk_prev_yi（用你已經抓到的前一交易日成交值）
+    hk_prev_yi_final = _round2(hk_prev_yi) if is_first_run_hk else _round2(old_h8_val)
 
     # build updates
     updates = []
@@ -605,7 +618,7 @@ def main():
     updates.append((f"{tab_q}!D8", [[_round2(hsi.get("close"))]]))
     updates.append((f"{tab_q}!E8", [[_round2(hsi.get("prev_close"))]]))
     updates.append((f"{tab_q}!H8", [[hk_today_yi]]))
-    updates.append((f"{tab_q}!I8", [[hk_prev_yi]]))
+    updates.append((f"{tab_q}!I8", [[hk_prev_yi_final]]))
 
     # TW rows D,E,H,I,J,K
     for r, code in tw_rows:
