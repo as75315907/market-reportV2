@@ -65,14 +65,17 @@ jobs:
             exit 1
           fi
 
-          git fetch origin reports:reports || true
+          # 第一次遠端沒有 reports 分支也沒關係
+          git fetch origin reports || true
+
+          # 切到 reports 分支；沒有就建立 orphan 分支
           git switch reports || git switch --orphan reports
 
+          # 只保留 reports/（乾淨）
           mkdir -p reports
-          cp -f "$FILE" "reports/Daily_Market_Report_${DATE}.xlsx"
+          git add "$FILE"
 
-          git add "reports/Daily_Market_Report_${DATE}.xlsx"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Market report ${DATE}" || echo "No changes to commit"
-          git push origin reports
+          git push -u origin reports
