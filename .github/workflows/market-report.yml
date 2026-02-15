@@ -50,6 +50,30 @@ jobs:
           rm -f tw_suffix_cache.json
           python daily_market_report_to_gsheet.py
 
+      - name: Prepare email body
+        if: success()
+        run: |
+          echo "MAIL_SUBJECT=✅ Daily Market Report 更新成功 - ${{ github.run_id }}" >> $GITHUB_ENV
+          {
+            echo "✅ 更新成功"
+            echo "更新執行時間（台北）：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "更新日期（台北）：$(date '+%Y-%m-%d')"
+            echo ""
+            echo "Repo: ${{ github.repository }}"
+            echo "Workflow: ${{ github.workflow }}"
+            echo "Run: ${{ github.run_id }}"
+            echo "Branch: ${{ github.ref_name }}"
+            echo "Commit: ${{ github.sha }}"
+            echo ""
+            echo "Google Sheet: ${{ secrets.GSHEET_SHEET_NAME }}"
+          } > mail_body.txt
+      
+          echo "MAIL_BODY<<EOF" >> $GITHUB_ENV
+          cat mail_body.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      
+      
+            
       - name: Email on success
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -58,18 +82,10 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USER }}
           password: ${{ secrets.MAIL_PASS }}
-          subject: "✅ Daily Market Report 更新成功 - ${{ github.run_id }}"
+          subject: ${{ env.MAIL_SUBJECT }}
           to: ${{ secrets.MAIL_TO }}
-          from: ${{ secrets.MAIL_FROM || secrets.MAIL_USER }}
-          body: |
-            ✅ 更新成功
-            Repo: ${{ github.repository }}
-            Workflow: ${{ github.workflow }}
-            Run: ${{ github.run_id }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-
-            Google Sheet: ${{ secrets.GSHEET_SHEET_NAME }}
+          from: ${{ secrets.MAIL_USER }}
+          body: ${{ env.MAIL_BODY }}
 
       - name: Email on failure
         if: failure()
