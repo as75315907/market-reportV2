@@ -13,9 +13,9 @@ jobs:
       DEBUG_HKEX: "0"
 
       GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
       GSHEET_SHEET_NAME: ${{ secrets.GSHEET_SHEET_NAME }}
       GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-      GSHEET_TAB: ${{ vars.GSHEET_TAB }}
 
     steps:
       - name: Checkout
