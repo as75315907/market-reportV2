@@ -7,10 +7,12 @@ Daily Market Report -> Google Sheets
 - TW stocks OHLCV: Prefer TWSE MI_INDEX (ALLBUT0999) for stability on GitHub Actions.
   If not found (e.g., TPEx/ESB), fallback to TPEx st43_result.php, then yfinance last resort.
 - HK stocks/indices: yfinance.
+- NEW: Revenue tab "營收" -> fill current month / YoY base / MoM base revenues from MOPSFIN CSV.
 
 Env required (GitHub Actions secrets/env):
   GSHEET_ID, GSHEET_TAB, GCP_SA_JSON
 Optional:
+  GSHEET_TAB_REVENUE=營收
   DEBUG_HKEX=1 (saves debug html)
 """
 
@@ -110,7 +112,25 @@ def _round2(x):
         return None
 
 def _today_taipei() -> datetime:
+    # GitHub Actions default is UTC; if you need strict Asia/Taipei, convert with zoneinfo.
     return datetime.now()
+
+
+def _is_blank_cell(v) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip()
+    return s in ("", "--", "—", "-")
+
+def _is_first_run_from_range(vals: list[list]) -> bool:
+    # If user cleared D/E/H/I/J/K, this block should be mostly empty.
+    if not vals:
+        return True
+    for row in vals:
+        for v in row:
+            if not _is_blank_cell(v):
+                return False
+    return True
 
 
 # ========= yfinance helpers =========
@@ -474,6 +494,19 @@ def hk_turnover_two_days(hsi_today_dt, hsi_prev_dt):
 
     return out_today, out_prev
 
+def hk_turnover_scan_prev(base_dt: datetime, max_back_days: int = 10) -> float | None:
+    # Scan backwards to find a valid previous trading day turnover
+    for i in range(1, max_back_days + 1):
+        d = base_dt - timedelta(days=i)
+        try:
+            hkd = parse_hkex_turnover_hkd(fetch_hkex_dayquot_html(d))
+            yi = normalize_hk_turnover_to_yi(hkd)
+            if yi is not None:
+                return yi
+        except Exception:
+            continue
+    return None
+
 
 # ========= Find rows =========
 def find_stock_rows_from_sheet(col_a: list[str], col_b: list[str]):
@@ -514,6 +547,169 @@ def find_stock_rows_from_sheet(col_a: list[str], col_b: list[str]):
     return tw_rows, hk_rows
 
 
+# ========= Revenue (營收) =========
+REV_TAB_DEFAULT = "營收"
+MOPSFIN_LISTED_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv"
+MOPSFIN_OTC_CSV    = "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv"
+
+def _ym_add(year: int, month: int, delta_months: int) -> tuple[int, int]:
+    y, m = year, month
+    m = m + delta_months
+    while m <= 0:
+        y -= 1
+        m += 12
+    while m >= 13:
+        y += 1
+        m -= 12
+    return y, m
+
+def _ym_label(year: int, month: int) -> str:
+    return f"{year}/{month:02d}月"
+
+def _parse_ym_any(v) -> tuple[int, int] | None:
+    if v is None:
+        return None
+    s = re.sub(r"\D", "", str(v))
+    if not s:
+        return None
+    # ROC yyyMM (5 digits) or AD yyyyMM (6 digits)
+    if len(s) == 5:
+        roc_y = int(s[:3])
+        m = int(s[3:])
+        return (roc_y + 1911, m)
+    if len(s) >= 6:
+        y = int(s[:4])
+        m = int(s[4:6])
+        if 1 <= m <= 12:
+            return (y, m)
+    return None
+
+def _find_colname(cols: list[str], includes: list[str], excludes: list[str] = None) -> str | None:
+    excludes = excludes or []
+    for c in cols:
+        cs = str(c)
+        if all(k in cs for k in includes) and not any(x in cs for x in excludes):
+            return c
+    return None
+
+def _download_csv_to_df(url: str) -> pd.DataFrame:
+    r = _SESSION.get(url, timeout=40)
+    r.raise_for_status()
+    text = r.content.decode("utf-8-sig", errors="ignore")
+    return pd.read_csv(StringIO(text), dtype=str)
+
+def fetch_monthly_revenue_maps() -> tuple[tuple[int, int] | None, dict]:
+    """
+    Return: (dataset_ym, revenue_map)
+    revenue_map[code] = {"this": float, "last_year": float, "last_month": float}
+    Unit: NTD thousand (仟元) as provided by dataset.
+    """
+    frames = []
+    for url in (MOPSFIN_LISTED_CSV, MOPSFIN_OTC_CSV):
+        try:
+            df = _download_csv_to_df(url)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            continue
+
+    if not frames:
+        return None, {}
+
+    df = pd.concat(frames, ignore_index=True)
+    cols = list(df.columns)
+
+    code_col = _find_colname(cols, ["公司", "代號"]) or _find_colname(cols, ["證券", "代號"]) or _find_colname(cols, ["公司代碼"])
+    ym_col   = _find_colname(cols, ["資料", "年月"]) or _find_colname(cols, ["資料年月"]) or _find_colname(cols, ["年月"])
+
+    this_col = _find_colname(cols, ["當月營收"], excludes=["累計"])
+    lastm_col= _find_colname(cols, ["上月營收"], excludes=["累計"])
+    lasty_col= _find_colname(cols, ["去年當月營收"], excludes=["累計"]) or _find_colname(cols, ["去年同期營收"], excludes=["累計"])
+
+    if not code_col or not this_col or not lastm_col or not lasty_col:
+        return None, {}
+
+    dataset_ym = None
+    if ym_col:
+        yms = []
+        for v in df[ym_col].dropna().tolist():
+            p = _parse_ym_any(v)
+            if p:
+                yms.append(p)
+        if yms:
+            dataset_ym = sorted(set(yms))[-1]
+
+    rev_map = {}
+    for _, row in df.iterrows():
+        code = str(row.get(code_col, "")).strip()
+        code = re.sub(r"\D", "", code)
+        if not code:
+            continue
+        this_v = _to_float(row.get(this_col))
+        lasty_v= _to_float(row.get(lasty_col))
+        lastm_v= _to_float(row.get(lastm_col))
+        if this_v is None and lasty_v is None and lastm_v is None:
+            continue
+        rev_map[code] = {"this": this_v, "last_year": lasty_v, "last_month": lastm_v}
+
+    return dataset_ym, rev_map
+
+def find_revenue_rows_from_sheet(col_a: list[str]):
+    # Revenue sheet layout: row2 is header, data starts row3; col A has codes.
+    rows = []
+    for r in range(3, 260 + 1):
+        idx = r - 1
+        if idx >= len(col_a):
+            break
+        v = (col_a[idx] or "").strip()
+        if v == "":
+            break
+        # might be like "2926.0" if read as float
+        v2 = re.sub(r"[^\d]", "", v)
+        if v2.isdigit():
+            rows.append((r, v2))
+    return rows
+
+def update_revenue_tab(svc, sheet_id: str):
+    tab = os.getenv("GSHEET_TAB_REVENUE", REV_TAB_DEFAULT).strip() or REV_TAB_DEFAULT
+    tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
+
+    ab = get_values(svc, sheet_id, f"{tab_q}!A1:B260")
+    col_a = [row[0] if len(row) > 0 else "" for row in ab]
+
+    rows = find_revenue_rows_from_sheet(col_a)
+
+    # Decide the reference month (usually previous month of today), but align to dataset month if available.
+    now = _today_taipei()
+    exp_y, exp_m = _ym_add(now.year, now.month, -1)
+
+    dataset_ym, rev_map = fetch_monthly_revenue_maps()
+    use_y, use_m = (dataset_ym if dataset_ym else (exp_y, exp_m))
+
+    # Headers:
+    # C2 = use_y/use_m
+    # D2 = use_y-1/use_m
+    # F2 = use_y/use_m - 1 month
+    y_ly, m_ly = use_y - 1, use_m
+    y_lm, m_lm = _ym_add(use_y, use_m, -1)
+
+    updates = []
+    updates.append((f"{tab_q}!C2", [[_ym_label(use_y, use_m)]]))
+    updates.append((f"{tab_q}!D2", [[_ym_label(y_ly, m_ly)]]))
+    updates.append((f"{tab_q}!F2", [[_ym_label(y_lm, m_lm)]]))
+
+    for r, code in rows:
+        d = rev_map.get(code, {})
+        updates.append((f"{tab_q}!C{r}", [[d.get("this")]]))
+        updates.append((f"{tab_q}!D{r}", [[d.get("last_year")]]))
+        updates.append((f"{tab_q}!F{r}", [[d.get("last_month")]]))
+
+    if updates:
+        batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
+
+    print(f"Revenue tab updated: {tab} | month={use_y}-{use_m:02d} | rows={len(rows)}")
+
+
 # ========= Main =========
 TICKER_TWII = "^TWII"
 TICKER_HSI  = "^HSI"
@@ -521,6 +717,17 @@ TICKER_HSI  = "^HSI"
 def main():
     svc, sheet_id, tab = gsheet_service()
     tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
+
+    # Detect "first run" (user cleared D/E/H/I/J/K)
+    first_block = get_values(svc, sheet_id, f"{tab_q}!D3:K60")
+    first_run = _is_first_run_from_range(first_block)
+
+    # Keep old HK turnover for right-shift (only if NOT first run)
+    old_hk_today = None
+    if not first_run:
+        v = get_values(svc, sheet_id, f"{tab_q}!H8:H8")
+        if v and v[0]:
+            old_hk_today = _to_float(v[0][0])
 
     ab = get_values(svc, sheet_id, f"{tab_q}!A1:B260")
     col_a = [row[0] if len(row) > 0 else "" for row in ab]
@@ -558,6 +765,16 @@ def main():
 
     hk_today_yi, hk_prev_yi = hk_turnover_two_days(hsi.get("t_date"), hsi.get("p_date"))
 
+    # If HK prev is missing:
+    if hk_prev_yi is None:
+        if (not first_run) and (old_hk_today is not None):
+            # right-shift from last run
+            hk_prev_yi = _round2(old_hk_today)
+        else:
+            # first run => scan back to find a valid previous trading day
+            base_dt = (hsi.get("t_date").to_pydatetime() if isinstance(hsi.get("t_date"), pd.Timestamp) else _today_taipei())
+            hk_prev_yi = hk_turnover_scan_prev(base_dt, max_back_days=10)
+
     # TW stocks
     tw_codes = [code for _, code in tw_rows]
     tw_today_map, tw_prev_map = tw_price_pack_for_codes(tw_codes, tw_t_dt, tw_p_dt)
@@ -591,19 +808,6 @@ def main():
             "volume": _last("Volume"),
         }
         time.sleep(0.2)
-    # ===== HK Turnover: shift-right with first-run fallback =====
-    # 你清空 D/E/H/I/J/K 時，第一次跑 H8 一定是空 -> 直接用 hk_prev_yi 當 prev
-    old_h8 = get_values(svc, sheet_id, f"{tab_q}!H8")
-    old_h8_val = None
-    if old_h8 and old_h8[0]:
-        old_h8_val = _to_float(old_h8[0][0])
-    
-    # 判斷是否「第一次跑」（或 H8 被清空）
-    is_first_run_hk = (old_h8_val is None)
-    
-    # 右移：正常情況 prev = 舊的 today
-    # 第一次跑：prev = hk_prev_yi（用你已經抓到的前一交易日成交值）
-    hk_prev_yi_final = _round2(hk_prev_yi) if is_first_run_hk else _round2(old_h8_val)
 
     # build updates
     updates = []
@@ -618,7 +822,7 @@ def main():
     updates.append((f"{tab_q}!D8", [[_round2(hsi.get("close"))]]))
     updates.append((f"{tab_q}!E8", [[_round2(hsi.get("prev_close"))]]))
     updates.append((f"{tab_q}!H8", [[hk_today_yi]]))
-    updates.append((f"{tab_q}!I8", [[hk_prev_yi_final]]))
+    updates.append((f"{tab_q}!I8", [[hk_prev_yi]]))
 
     # TW rows D,E,H,I,J,K
     for r, code in tw_rows:
@@ -670,11 +874,15 @@ def main():
 
     batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
 
+    # NEW: update Revenue tab
+    update_revenue_tab(svc, sheet_id)
+
     print("DONE: updated Google Sheet")
     print(f"TW rows: {len(tw_rows)} | HK rows: {len(hk_rows)}")
     print(f"TW dates: {tw_t_dt.date()} / {tw_p_dt.date()}")
     print(f"TWII turnover (today/prev, 億元): {tw_today_yi} / {tw_prev_yi}")
     print(f"HK turnover (today/prev, 億港幣): {hk_today_yi} / {hk_prev_yi}")
+    print(f"first_run={first_run}")
 
 
 if __name__ == "__main__":
