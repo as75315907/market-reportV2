@@ -293,7 +293,12 @@ def write_cell(ws, addr: str, value):
 
 # ========= TWSE 成交金額（元） -> 億元 =========
 _SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+_SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.twse.com.tw/zh/trading/historical/fmtqik.html",
+})
 
 def _safe_get(url: str, *, timeout: int = 30, headers: dict | None = None, verify: bool | None = None):
     """優先用 verify=True；若遇到公司網路 SSL 攔截導致驗證失敗，會自動降級 verify=False。
