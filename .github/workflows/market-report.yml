@@ -43,6 +43,7 @@ jobs:
 
       - name: Run report
         run: |
+          rm -f tw_suffix_cache.json
           python daily_market_report_turnover_twse_fmtqik_hkex_v3_fixhk6_dailyoverwrite.py
           ls -la reports
 
