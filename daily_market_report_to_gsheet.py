@@ -611,8 +611,7 @@ def find_stock_rows_from_sheet(grid: List[List[Any]]) -> Tuple[List[Tuple[int, s
             row = grid[r - 1] if r - 1 < len(grid) else []
             preview_lines.append(f"{r:03d}: " + " | ".join(str(x) for x in (row[:8] if row else [])))
         raise RuntimeError(
-            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。
-"
+            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。\n"
             + "\n".join(preview_lines)
         )
 
