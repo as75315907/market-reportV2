@@ -1,146 +1,246 @@
 # -*- coding: utf-8 -*-
+"""
+Daily Market Report -> Google Sheets (GitHub Actions friendly)
+
+What this script does
+- Reads your Google Sheet tab (e.g. "IR_updated (PC HOME)")
+- Locates TW/HK stock blocks by **Column A patterns** (no need to find "台股（台幣）/港股（港幣）" titles):
+    - TW block: A cell is a 4-digit code (e.g. 2926)
+    - HK block: A cell is like 03368.HK / 825.HK
+- Updates fixed cells:
+    - L3: update timestamp
+    - D6/E6: TWII close / prev close (best-effort, uses yfinance; if blocked, leaves blank)
+    - H6/I6: TWII turnover today/prev (億元) from TWSE FMTQIK
+    - D8/E8: HSI close / prev close (best-effort, uses yfinance; if blocked, leaves blank)
+    - H8/I8: HK market turnover today/prev (億港幣) from HKEX Day Quotations (with AASTOCKS fallback)
+- Updates each stock row (keeps formulas intact by writing only these columns):
+    - D: 今日收盤
+    - E: 前一交易日收盤
+    - H: 開盤
+    - I: 最低
+    - J: 最高
+    - K: 成交張數 (台股=成交股數/1000；港股=成交股數/lot_size, default 1000)
+
+Required GitHub Secrets (or env)
+- GSHEET_ID: Google Sheet ID (the long id in URL)
+- GSHEET_TAB: sheet tab name, e.g. IR_updated (PC HOME)
+- GCP_SA_JSON: Google Service Account JSON (string)
+    Tip: if private_key has \\n, script will convert to real newlines.
+
+Optional
+- DEBUG_HKEX=1 to save HKEX/AASTOCKS HTML in debug/
+"""
+
 import os
+import re
 import json
 import math
 import time
-import re
+import subprocess
+from io import StringIO
+from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Any, Optional
 
 import pandas as pd
-import yfinance as yf
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+import yfinance as yf
 
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from google.oauth2 import service_account
 
-# ============ 基本設定 ============
-TICKER_TWII = "^TWII"
-TICKER_HSI  = "^HSI"
-TWSE_FMTQIK = "https://www.twse.com.tw/exchangeReport/FMTQIK"
-HKEX_DAYQUOT = "https://www.hkex.com.hk/eng/stat/smstat/dayquot/d{yymmdd}e.htm"
 
-CACHE_FILE = "tw_suffix_cache.json"
+# ========= Config =========
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Google Sheet env
-GSHEET_ID  = os.getenv("GSHEET_ID", "").strip()
-GSHEET_TAB = os.getenv("GSHEET_TAB", "IR_updated (PC HOME)").strip()
+GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+GSHEET_TAB = os.getenv("GSHEET_TAB", "").strip()
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-_SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": UA})
+DEBUG_HKEX = os.getenv("DEBUG_HKEX", "") == "1"
+DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 
-# ============ 小工具 ============
+# Indices (Yahoo, best-effort; may be blocked on GitHub IP sometimes)
+TICKER_TWII = "^TWII"
+TICKER_HSI = "^HSI"
+
+# TWSE month JSON (turnover)
+TWSE_FMTQIK = "https://www.twse.com.tw/exchangeReport/FMTQIK"
+
+# HKEX turnover (day quotations)
+HKEX_DAYQUOT = "https://www.hkex.com.hk/eng/stat/smstat/dayquot/d{yymmdd}e.htm"
+HKEX_DAYQUOT_REFERER = "https://www.hkex.com.hk/eng/stat/smstat/dayquot/qtn.asp"
+AASTOCKS_HSI_URL = "https://www.aastocks.com/tc/stocks/market/index/hk-index-con.aspx?index=HSI&o=0&p=&s=8&t=6"
+
+# TWSE daily quotes (all listed stocks)
+TWSE_MI_INDEX_URLS = [
+    "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+    "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+]
+
+
+# ========= Small utils =========
+def _debug_save(name: str, text: str):
+    if not DEBUG_HKEX:
+        return
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        Path(os.path.join(DEBUG_DIR, name)).write_text(text or "", encoding="utf-8", errors="ignore")
+    except Exception:
+        pass
+
 def _isnan(x) -> bool:
     try:
         return x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
     except Exception:
         return True
 
+def _to_float(s):
+    if s is None:
+        return None
+    if isinstance(s, (int, float)) and not (isinstance(s, float) and math.isnan(s)):
+        return float(s)
+    st = str(s).strip().replace(",", "")
+    if st in ("", "--", "—", "NA", "N/A"):
+        return None
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", st)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+def _to_int(s):
+    f = _to_float(s)
+    if f is None:
+        return None
+    try:
+        return int(round(f))
+    except Exception:
+        return None
+
 def _round2(x):
-    if _isnan(x):
+    if x is None:
         return None
     try:
         return round(float(x), 2)
     except Exception:
         return None
 
-def load_cache() -> dict:
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+def _hkex_yymmdd(dt: datetime) -> str:
+    return dt.strftime("%y%m%d")
 
-def save_cache(cache: dict):
+
+# ========= Google Sheets helpers =========
+def gsheet_service():
+    if not GSHEET_ID or not GCP_SA_JSON or not GSHEET_TAB:
+        raise RuntimeError("缺少 GSHEET_ID / GSHEET_TAB / GCP_SA_JSON（請在 GitHub Secrets/Env 設定）")
+
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        info = json.loads(GCP_SA_JSON)
+    except Exception as e:
+        raise RuntimeError(f"GCP_SA_JSON 不是合法 JSON：{e}")
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def hist_one(ticker: str) -> pd.DataFrame:
-    return yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
+    # Fix private_key newlines if stored as one-line secret
+    pk = info.get("private_key")
+    if isinstance(pk, str) and "\\n" in pk and "\n" not in pk:
+        info["private_key"] = pk.replace("\\n", "\n")
 
-def has_enough_prices(hist: pd.DataFrame) -> bool:
-    if hist is None or hist.empty:
-        return False
-    if "Close" not in hist.columns:
-        return False
-    return hist["Close"].dropna().shape[0] >= 2
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return svc
 
-def resolve_tw_ticker(code: str, cache: dict) -> str:
-    code = str(code).strip()
-    if code in cache:
-        return f"{code}.{cache[code]}"
+def sheet_values_get(svc, a1_range: str):
+    return svc.spreadsheets().values().get(
+        spreadsheetId=GSHEET_ID, range=a1_range
+    ).execute()
 
-    for suf in ["TWO", "TW"]:
-        t = f"{code}.{suf}"
-        try:
-            h = hist_one(t)
-            if has_enough_prices(h):
-                cache[code] = suf
-                return t
-        except Exception:
-            continue
+def sheet_values_batch_update(svc, data: list[dict], value_input_option: str = "USER_ENTERED"):
+    body = {"valueInputOption": value_input_option, "data": data}
+    return svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=GSHEET_ID, body=body
+    ).execute()
 
-    cache[code] = "TW"
-    return f"{code}.TW"
 
-def hk_ticker(code: str) -> str:
-    return f"{int(str(code)):04d}.HK"
+# ========= Find TW/HK stock rows by Column A patterns =========
+_TW_RE = re.compile(r"^\s*\d{4}\s*$")
+_HK_RE = re.compile(r"^\s*\d{1,5}\s*\.HK\s*$", re.I)
 
-def last_two(series: pd.Series):
-    s = series.dropna()
-    if len(s) < 2:
-        return (pd.NaT, math.nan, pd.NaT, math.nan)
-    return s.index[-1], float(s.iloc[-1]), s.index[-2], float(s.iloc[-2])
+def _norm_cell_str(v) -> str:
+    if v is None:
+        return ""
+    # Google Sheets API may return numbers as "2926" (string) or "2926.0"
+    if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+        return str(int(v))
+    s = str(v).strip()
+    # handle "2926.0"
+    m = re.fullmatch(r"(\d{4})\.0", s)
+    if m:
+        return m.group(1)
+    return s
 
-def build_ohlcv_map(ticker_list: List[str]) -> Dict[str, Dict[str, Any]]:
-    out = {}
-    for t in ticker_list:
-        try:
-            h = hist_one(t)
-        except Exception:
-            h = pd.DataFrame()
+def find_stock_rows_from_col_a(col_a_vals: list):
+    """
+    Returns:
+      tw_rows: list[(row_index, code4)]
+      hk_rows: list[(row_index, code4)]  # code4 is zero-filled 4-digit for hk
+    """
+    # Normalize all A values
+    A = [_norm_cell_str(x) for x in col_a_vals]
+    tw_start = None
+    hk_start = None
 
-        if h is None or h.empty or "Close" not in h.columns or h["Close"].dropna().shape[0] < 2:
-            out[t] = {}
-            continue
+    # First TW code row
+    for i, s in enumerate(A, start=1):
+        if _TW_RE.match(s):
+            tw_start = i
+            break
 
-        t_date, t_close, p_date, p_close = last_two(h["Close"])
+    # First HK code row (search after tw_start if possible)
+    start_idx = (tw_start or 1) - 1
+    for i in range(start_idx, len(A)):
+        if _HK_RE.match(A[i]):
+            hk_start = i + 1
+            break
 
-        def _last(col):
-            if col not in h.columns:
-                return math.nan
-            s = h[col].dropna()
-            return float(s.iloc[-1]) if len(s) else math.nan
+    if tw_start is None or hk_start is None:
+        raise RuntimeError("無法在 A 欄自動定位台股/港股區塊：請確認 A 欄是否有台股4碼與港股xxxx.HK 代碼。")
 
-        out[t] = {
-            "t_date": t_date,
-            "p_date": p_date,
-            "close": float(t_close),
-            "prev_close": float(p_close),
-            "open": _last("Open"),
-            "high": _last("High"),
-            "low":  _last("Low"),
-            "volume": _last("Volume"),
-        }
-        time.sleep(0.2)
-    return out
+    # TW rows: from tw_start until hk_start-1, stop on first non-4digit/blank
+    tw_rows = []
+    r = tw_start
+    while r < hk_start:
+        s = A[r - 1] if r - 1 < len(A) else ""
+        if not _TW_RE.match(s):
+            break
+        tw_rows.append((r, s))
+        r += 1
 
-# ============ TWSE 成交金額 ============
+    # HK rows: from hk_start downward, stop on first non-HK/blank
+    hk_rows = []
+    r = hk_start
+    while r <= len(A):
+        s = A[r - 1] if r - 1 < len(A) else ""
+        if not _HK_RE.match(s):
+            break
+        code = re.sub(r"\s*\.HK\s*$", "", s, flags=re.I).strip()
+        hk_rows.append((r, code.zfill(4)))
+        r += 1
+
+    return tw_rows, hk_rows
+
+
+# ========= TWSE turnover (FMTQIK) =========
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": UA})
+
 def _ad_to_twse_date_str(dt: datetime) -> str:
-    # TWSE FMTQIK 第一欄通常是民國日期：YYY/MM/DD
-    roc = dt.year - 1911
-    return f"{roc}/{dt.month:02d}/{dt.day:02d}"
+    # ROC year like "115/02/11"
+    roc_y = dt.year - 1911
+    return f"{roc_y:03d}/{dt.month:02d}/{dt.day:02d}"
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 def fetch_fmtqik_month_json(dt: datetime) -> dict:
     month_key = dt.strftime("%Y%m") + "01"
     params = {"response": "json", "date": month_key}
@@ -152,7 +252,7 @@ def fetch_fmtqik_month_json(dt: datetime) -> dict:
         raise RuntimeError(f"FMTQIK no data for {month_key}")
     return obj
 
-def extract_turnover_from_fmtqik(obj: dict, dt: datetime) -> Optional[int]:
+def extract_turnover_from_fmtqik(obj: dict, dt: datetime) -> int | None:
     target = _ad_to_twse_date_str(dt)
     data = obj.get("data", [])
     if not isinstance(data, list):
@@ -183,7 +283,8 @@ def extract_turnover_from_fmtqik(obj: dict, dt: datetime) -> Optional[int]:
                 return int(s)
     return None
 
-def twse_turnover_yi(dt: datetime) -> Optional[float]:
+def twse_turnover_yi(dt: datetime) -> float | None:
+    """Return turnover in 億元 (TWD 1e8)."""
     try:
         obj = fetch_fmtqik_month_json(dt)
         val = extract_turnover_from_fmtqik(obj, dt)
@@ -193,408 +294,442 @@ def twse_turnover_yi(dt: datetime) -> Optional[float]:
     except Exception:
         return None
 
-# ============ HKEX 成交額（簡化版：抓網頁內的 “Turnover” 數字） ============
-def _fetch_hkex_dayquot_html(dt: datetime) -> str:
-    yymmdd = dt.strftime("%y%m%d")
-    url = HKEX_DAYQUOT.format(yymmdd=yymmdd)
-    r = _SESSION.get(url, timeout=30)
-    r.raise_for_status()
-    return r.text
-
-def _parse_hkex_turnover_from_html(html: str) -> Optional[float]:
-    # 很粗但實務可用：抓 “Turnover” 後面最大的數字（單位通常為 HK$ million）
-    # 你原本 fixhk6 有更完整邏輯；想要 100% 沿用也可以把那段搬過來。
-    txt = re.sub(r"\s+", " ", html)
-    m = re.search(r"Turnover[^0-9]{0,50}([0-9,]+\.[0-9]+|[0-9,]+)", txt, re.IGNORECASE)
-    if not m:
-        return None
-    s = m.group(1).replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def hkex_turnover_yi(dt: datetime) -> Optional[float]:
-    """
-    回傳：億港幣
-    HKEX dayquot 常見 turnover 單位是 HK$ million（百萬港幣）
-    若抓到的是 million，轉成 億：million / 100
-    """
-    try:
-        html = _fetch_hkex_dayquot_html(dt)
-        val_million = _parse_hkex_turnover_from_html(html)
-        if val_million is None:
-            return None
-        return round(val_million / 100.0, 2)
-    except Exception:
-        return None
-
-def get_two_hk_turnover_by_dates(t_date, p_date) -> Tuple[Optional[float], Optional[float]]:
-    def to_dt(x):
-        if isinstance(x, pd.Timestamp):
-            return x.to_pydatetime()
-        if isinstance(x, datetime):
-            return x
-        return None
-    dt1 = to_dt(t_date)
-    dt2 = to_dt(p_date)
-    return (hkex_turnover_yi(dt1) if dt1 else None, hkex_turnover_yi(dt2) if dt2 else None)
-
-# ============ Google Sheets ============
-def gsheet_service():
-    if not (GSHEET_ID and GCP_SA_JSON):
-        raise RuntimeError("缺少 GSHEET_ID 或 GCP_SA_JSON（請在 GitHub Secrets/Env 設定）")
-    info = json.loads(GCP_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-def a1(col: str, row: int) -> str:
-    return f"{col}{row}"
-
-def fetch_col_a_values(svc, max_rows=250):
-    rng = f"'{GSHEET_TAB}'!A1:A{max_rows}"
-    res = svc.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=rng).execute()
-    vals = res.get("values", [])
-    # 轉成 list[str]，空的補 ""
-    out = []
-    for i in range(max_rows):
-        if i < len(vals) and len(vals[i]) > 0:
-            out.append(str(vals[i][0]))
-        else:
-            out.append("")
-    return out  # index 0 => row 1
-
-def find_stock_rows_from_sheet(col_a: List[str]) -> Tuple[List[Tuple[int,str]], List[Tuple[int,str]]]:
-    """
-    依你 excel 模板的找法：先找「台股（台幣）」與「港股（港幣）」標題列，
-    然後往下抓代碼直到遇到空白。
-    """
-    tw_start = None
-    hk_start = None
-    for idx, v in enumerate(col_a, start=1):
-        s = str(v).strip()
-        if tw_start is None and "台股" in s and "台幣" in s:
-            tw_start = idx + 1
-        if hk_start is None and "港股" in s and "港幣" in s:
-            hk_start = idx + 1
-
-    if tw_start is None or hk_start is None:
-        raise RuntimeError("找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面")
-
-    tw_rows = []
-    r = tw_start
-    while r < hk_start:
-        code = col_a[r-1].strip()
-        if not code:
-            break
-        if code.isdigit():
-            tw_rows.append((r, code))
-        r += 1
-
-    hk_rows = []
-    r = hk_start
-    for _ in range(0, 80):
-        code = col_a[r-1].strip()
-        if not code:
-            break
-        code = code.replace(".HK", "").replace("HK", "").strip()
-        hk_rows.append((r, code))
-        r += 1
-
-    return tw_rows, hk_rows
-
-def batch_update(svc, updates: List[Tuple[str, Any]]):
-    """
-    updates: [(A1, value), ...]
-    """
-    data = []
-    for cell, val in updates:
-        # Google Sheets 的 datetime 建議直接寫字串，避免時區顯示亂掉
-        if isinstance(val, datetime):
-            val = val.strftime("%Y-%m-%d %H:%M:%S")
-        data.append({"range": f"'{GSHEET_TAB}'!{cell}", "values": [[val]]})
-
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    svc.spreadsheets().values().batchUpdate(spreadsheetId=GSHEET_ID, body=body).execute()
+def latest_two_tw_trade_dates(max_back_days: int = 20) -> tuple[datetime, datetime]:
+    """Find latest 2 trading dates by probing FMTQIK backward."""
+    d = datetime.now().date()
+    found = []
+    for _ in range(max_back_days):
+        dt = datetime(d.year, d.month, d.day)
+        yi = twse_turnover_yi(dt)
+        if yi is not None:
+            found.append(dt)
+            if len(found) >= 2:
+                return found[0], found[1]
+        d = d - timedelta(days=1)
+    raise RuntimeError("找不到最近兩個台股交易日（FMTQIK 回傳皆為 None），請檢查 TWSE 是否可連線。")
 
 
-# ========= 台股個股 OHLCV（不用 Yahoo，避免 GitHub Actions 404） =========
-# 上市：TWSE STOCK_DAY
-TWSE_STOCK_DAY = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-# 上櫃：TPEx st43_result (json)
-TPEX_STOCK_DAY = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-
-def _roc_to_ad_date_str(roc_date: str) -> str | None:
-    """'115/02/15' -> '2026-02-15'"""
-    s = str(roc_date).strip()
-    m = re.match(r"^(\d{2,3})/(\d{1,2})/(\d{1,2})$", s)
-    if not m:
-        return None
-    y = int(m.group(1)) + 1911
-    mm = int(m.group(2))
-    dd = int(m.group(3))
-    return f"{y:04d}-{mm:02d}-{dd:02d}"
-
-def _num_to_float(x):
-    s = str(x).strip().replace(",", "")
-    if s in ("", "--", "NaN", "nan", "None"):
-        return None
-    m = re.search(r"-?\d+(?:\.\d+)?", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(0))
-    except Exception:
-        return None
-
-def _num_to_int(x):
-    v = _num_to_float(x)
-    if v is None:
-        return None
-    try:
-        return int(round(v))
-    except Exception:
-        return None
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-def fetch_twse_stock_month(code: str, yyyymmdd: str) -> dict:
-    # yyyymmdd: '20260201'
-    params = {"response": "json", "date": yyyymmdd, "stockNo": str(code).strip()}
-    r = _SESSION.get(TWSE_STOCK_DAY, params=params, timeout=30, headers={"User-Agent": UA})
-    r.raise_for_status()
-    return r.json()
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-def fetch_tpex_stock_month(code: str, roc_y_mm: str) -> dict:
-    # roc_y_mm: '115/02'
-    params = {"l": "zh-tw", "d": roc_y_mm, "stkno": str(code).strip()}
-    r = _SESSION.get(TPEX_STOCK_DAY, params=params, timeout=30, headers={"User-Agent": UA})
-    r.raise_for_status()
-    return r.json()
-
-def _collect_twse_rows(obj: dict) -> list[dict]:
-    out = []
-    data = obj.get("data", [])
-    if not isinstance(data, list):
-        return out
-    for row in data:
-        if not isinstance(row, list) or len(row) < 7:
-            continue
-        ad = _roc_to_ad_date_str(row[0])
-        if not ad:
-            continue
-        vol = _num_to_int(row[1])  # 成交股數
-        opn = _num_to_float(row[3])
-        high = _num_to_float(row[4])
-        low = _num_to_float(row[5])
-        close = _num_to_float(row[6])
-        if close is None:
-            continue
-        out.append({"date": ad, "open": opn, "high": high, "low": low, "close": close, "volume": vol})
-    return out
-
-def _collect_tpex_rows(obj: dict) -> list[dict]:
-    out = []
-    data = obj.get("aaData") or obj.get("data") or []
-    if not isinstance(data, list):
-        return out
-    for row in data:
-        if not isinstance(row, list) or len(row) < 7:
-            continue
-        ad = _roc_to_ad_date_str(row[0])
-        if not ad:
-            continue
-        vol = _num_to_int(row[1])  # 成交股數
-        opn = _num_to_float(row[3])
-        high = _num_to_float(row[4])
-        low = _num_to_float(row[5])
-        close = _num_to_float(row[6])
-        if close is None:
-            continue
-        out.append({"date": ad, "open": opn, "high": high, "low": low, "close": close, "volume": vol})
-    return out
-
-def tw_stock_last_two(code: str, ref_dt: datetime) -> dict:
-    """回傳 dict: {t_date, p_date, close, prev_close, open, high, low, volume}
-    - 先試 TWSE（上市），無資料再試 TPEx（上櫃）
-    - 會抓「本月 + 上月」避免月初抓不到前一交易日
-    """
-    code = str(code).strip()
-
-    cur = ref_dt
-    prev = (ref_dt.replace(day=1) - timedelta(days=1))
-
-    def yyyymm_first(d: datetime) -> str:
-        return d.strftime("%Y%m") + "01"
-
-    def roc_y_mm(d: datetime) -> str:
-        return f"{d.year - 1911:03d}/{d.month:02d}"
-
-    rows = []
-    # --- TWSE ---
-    try:
-        obj_prev = fetch_twse_stock_month(code, yyyymm_first(prev))
-        obj_cur  = fetch_twse_stock_month(code, yyyymm_first(cur))
-        rows = _collect_twse_rows(obj_prev) + _collect_twse_rows(obj_cur)
-    except Exception:
-        rows = []
-
-    # --- TPEx ---
-    if len(rows) < 2:
+# ========= TWSE daily stock quotes (MI_INDEX) =========
+def fetch_twse_mi_index(date_dt: datetime) -> dict:
+    ymd = date_dt.strftime("%Y%m%d")
+    params = {"response": "json", "date": ymd, "type": "ALLBUT0999"}
+    last_err = None
+    for url in TWSE_MI_INDEX_URLS:
         try:
-            obj_prev = fetch_tpex_stock_month(code, roc_y_mm(prev))
-            obj_cur  = fetch_tpex_stock_month(code, roc_y_mm(cur))
-            rows = _collect_tpex_rows(obj_prev) + _collect_tpex_rows(obj_cur)
-        except Exception:
-            rows = []
+            r = _SESSION.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"TWSE MI_INDEX 取得失敗：{last_err}")
 
-    if len(rows) < 2:
+def parse_twse_quotes(obj: dict) -> dict:
+    """
+    Return: {code: {"open","high","low","close","volume_shares"}}
+    This parses the table that contains fields including:
+      證券代號, 開盤價, 最高價, 最低價, 收盤價, 成交股數
+    """
+    tables = obj.get("tables", [])
+    if not isinstance(tables, list):
         return {}
 
-    rows = sorted(rows, key=lambda x: x["date"])
-    t = rows[-1]
-    p = rows[-2]
+    for tb in tables:
+        fields = tb.get("fields", [])
+        data = tb.get("data", [])
+        if not isinstance(fields, list) or not isinstance(data, list):
+            continue
+        f = [str(x).strip() for x in fields]
+        # Must include key fields
+        if "證券代號" not in f or "收盤價" not in f:
+            continue
 
-    t_date = pd.to_datetime(t["date"])
-    p_date = pd.to_datetime(p["date"])
+        # Identify column indexes (some tables are not stock quotes; filter by having these)
+        def idx(name: str):
+            try:
+                return f.index(name)
+            except Exception:
+                return None
 
-    return {
-        "t_date": t_date,
-        "p_date": p_date,
-        "close": float(t["close"]),
-        "prev_close": float(p["close"]),
-        "open": float(t["open"]) if t["open"] is not None else math.nan,
-        "high": float(t["high"]) if t["high"] is not None else math.nan,
-        "low":  float(t["low"])  if t["low"]  is not None else math.nan,
-        "volume": float(t["volume"]) if t["volume"] is not None else math.nan,
+        i_code = idx("證券代號")
+        i_open = idx("開盤價")
+        i_high = idx("最高價")
+        i_low  = idx("最低價")
+        i_close = idx("收盤價")
+        i_vol  = idx("成交股數")
+
+        if i_code is None or i_close is None or i_open is None or i_high is None or i_low is None or i_vol is None:
+            continue
+
+        out = {}
+        for row in data:
+            if not isinstance(row, list) or len(row) <= max(i_code, i_open, i_high, i_low, i_close, i_vol):
+                continue
+            code = str(row[i_code]).strip()
+            if not re.fullmatch(r"\d{4}", code):
+                continue
+            out[code] = {
+                "open": _to_float(row[i_open]),
+                "high": _to_float(row[i_high]),
+                "low": _to_float(row[i_low]),
+                "close": _to_float(row[i_close]),
+                "volume_shares": _to_int(row[i_vol]),
+            }
+        if out:
+            return out
+    return {}
+
+
+# ========= HKEX turnover parsing =========
+def _curl_get_text(url: str, timeout: int = 30, insecure: bool = False, http1: bool = True, extra_headers: list[str] | None = None) -> str:
+    cmd = ["curl", "-L", "-s", "--max-time", str(timeout), "-A", UA]
+    if http1:
+        cmd.append("--http1.1")
+    if extra_headers:
+        for h in extra_headers:
+            cmd += ["-H", h]
+    if insecure:
+        cmd.insert(1, "-k")
+    cmd.append(url)
+    return subprocess.check_output(cmd, text=True, encoding="utf-8", errors="ignore")
+
+def fetch_hkex_dayquot_html(trade_dt: datetime) -> str:
+    yymmdd = _hkex_yymmdd(trade_dt)
+    url = HKEX_DAYQUOT.format(yymmdd=yymmdd)
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+        "Referer": HKEX_DAYQUOT_REFERER,
     }
-
-def build_tw_stock_map(codes: list[str], ref_dt: datetime) -> dict:
-    out = {}
-    for c in codes:
+    try:
+        r = _SESSION.get(url, timeout=30, headers=headers)
+        r.raise_for_status()
         try:
-            out[str(c).strip()] = tw_stock_last_two(str(c).strip(), ref_dt)
+            r.encoding = r.apparent_encoding or r.encoding
         except Exception:
-            out[str(c).strip()] = {}
-        time.sleep(0.2)
+            pass
+        html = r.text or ""
+        _debug_save(f"hkex_dayquot_{yymmdd}_requests.html", html)
+        low = html.lower()
+        if ("turnover" not in low) and ("成交" not in html) and ("daily quotations" not in low):
+            raise RuntimeError("HKEX 回傳內容疑似非日報頁")
+        return html
+    except Exception as e_req:
+        _debug_save(f"hkex_dayquot_{yymmdd}_requests_error.log", repr(e_req))
+        curl_headers = [
+            f"Referer: {HKEX_DAYQUOT_REFERER}",
+            "Accept-Language: en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+        ]
+        try:
+            html = _curl_get_text(url, timeout=30, insecure=False, http1=True, extra_headers=curl_headers)
+            _debug_save(f"hkex_dayquot_{yymmdd}_curl.html", html)
+            return html
+        except Exception:
+            html = _curl_get_text(url, timeout=30, insecure=True, http1=True, extra_headers=curl_headers)
+            _debug_save(f"hkex_dayquot_{yymmdd}_curl_insecure.html", html)
+            return html
+
+def parse_hkex_turnover_hkd(html: str) -> float:
+    """Return HK market turnover in HKD (not in Yi)."""
+    if not html:
+        raise RuntimeError("HKEX HTML 空白")
+
+    rx_candidates = [
+        r"Total\s+Market\s+Turnover\s*\(\s*HK\$\s*Million\s*\)[^0-9]{0,300}([0-9][0-9,]*\.?[0-9]*)",
+        r"Total\s+Market\s+Turnover[^0-9]{0,300}([0-9][0-9,]*\.?[0-9]*)",
+        r"市場\s*成交額[^0-9]{0,300}([0-9][0-9,]*\.?[0-9]*)",
+        r"成交\s*(?:額|金額)[^0-9]{0,300}([0-9][0-9,]*\.?[0-9]*)",
+    ]
+    for rx in rx_candidates:
+        m = re.search(rx, html, flags=re.I)
+        if m:
+            v = float(m.group(1).replace(",", ""))
+            # HKEX dayquot commonly uses HK$ Million
+            if v >= 10_000:
+                return v * 1_000_000.0
+            return v
+
+    # fallback: read_html
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception as e:
+        raise RuntimeError(f"HKEX read_html 失敗：{e}")
+
+    def _unit_multiplier(col_text: str, sample_val: float | None):
+        t = (col_text or "").lower()
+        if "million" in t or "mn" in t or "百萬" in col_text or "百万" in col_text:
+            return 1_000_000.0
+        if "billion" in t or "bn" in t or "十億" in col_text or "十亿" in col_text:
+            return 1_000_000_000.0
+        # default assume million
+        if sample_val is not None and 10_000 <= sample_val <= 1_000_000:
+            return 1_000_000.0
+        return 1.0
+
+    def _to_float_any(x):
+        s = str(x).strip().replace(",", "")
+        m = re.search(r"([0-9][0-9]*\.?[0-9]*)", s)
+        return float(m.group(1)) if m else None
+
+    for df in tables:
+        try:
+            df = df.fillna("")
+        except Exception:
+            pass
+        cols = [str(c).strip() for c in getattr(df, "columns", [])]
+        if not cols:
+            continue
+        # find turnover column
+        idxs = [i for i, c in enumerate(cols) if ("turnover" in c.lower()) or ("成交額" in c) or ("成交金額" in c) or ("成交金额" in c)]
+        if not idxs:
+            continue
+        idx = idxs[0]
+        series = df.iloc[:, idx]
+        # find total row if any
+        pick = None
+        if df.shape[1] >= 2:
+            first_col = df.iloc[:, 0].astype(str).str.strip()
+            mask = first_col.str.contains(r"^(total|總計|合計)$", case=False, regex=True)
+            if mask.any():
+                v = _to_float_any(series[mask].iloc[-1])
+                if v is not None:
+                    pick = v
+        if pick is None:
+            vals = [v for v in (_to_float_any(x) for x in series.tolist()) if v is not None]
+            if vals:
+                pick = vals[-1]
+        if pick is None:
+            continue
+        mult = _unit_multiplier(cols[idx], pick)
+        return pick * mult
+
+    raise RuntimeError("HKEX 找不到 Turnover")
+
+def fetch_aastocks_hsi_html() -> str:
+    r = _SESSION.get(
+        AASTOCKS_HSI_URL,
+        timeout=30,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            "Referer": "https://www.aastocks.com/",
+        },
+    )
+    r.raise_for_status()
+    try:
+        r.encoding = r.apparent_encoding or r.encoding
+    except Exception:
+        pass
+    html = r.text or ""
+    _debug_save("aastocks_hsi.html", html)
+    return html
+
+def parse_aastocks_turnover_yi(html: str) -> float:
+    """Return turnover in 億港幣 (HKD 1e8)."""
+    if not html:
+        raise RuntimeError("AASTOCKS HTML 空白")
+    m = re.search(r'(?:成交額|Turnover)[^0-9]{0,80}([0-9][0-9,]*\.?[0-9]*)\s*([BbMm億])', html, flags=re.I)
+    if not m:
+        m = re.search(r'class=["\']turnover["\'][^>]*>\s*([0-9][0-9,]*\.?[0-9]*)\s*([BbMm億])', html, flags=re.I)
+    if not m:
+        raise RuntimeError("AASTOCKS 找不到成交額/Turnover")
+    num = float(m.group(1).replace(",", ""))
+    unit = m.group(2)
+    if unit == "億":
+        return round(num, 2)
+    if unit in ("B", "b"):  # HKD billions
+        return round(num * 10.0, 2)
+    if unit in ("M", "m"):  # HKD millions
+        return round(num / 100.0, 2)
+    return round(num, 2)
+
+def fetch_hkex_turnover_yi(date_dt: datetime) -> float:
+    html = fetch_hkex_dayquot_html(date_dt)
+    hkd = parse_hkex_turnover_hkd(html)
+    return round(hkd / 1e8, 2)
+
+def get_two_hk_turnover_by_dates(hk_today_dt: datetime, hk_prev_dt: datetime) -> tuple[float | None, float | None]:
+    out_today = None
+    out_prev = None
+    try:
+        out_today = fetch_hkex_turnover_yi(hk_today_dt)
+    except Exception:
+        out_today = None
+    if out_today is None:
+        try:
+            out_today = parse_aastocks_turnover_yi(fetch_aastocks_hsi_html())
+        except Exception:
+            out_today = None
+
+    try:
+        out_prev = fetch_hkex_turnover_yi(hk_prev_dt)
+    except Exception:
+        out_prev = None
+    return out_today, out_prev
+
+
+# ========= Yahoo helpers (HK stocks and indices) =========
+def hist_one(ticker: str) -> pd.DataFrame:
+    return yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
+
+def last_two(series: pd.Series):
+    s = series.dropna()
+    if len(s) < 2:
+        return (pd.NaT, math.nan, pd.NaT, math.nan)
+    return s.index[-1], float(s.iloc[-1]), s.index[-2], float(s.iloc[-2])
+
+def build_yahoo_ohlcv_map(tickers: list[str]) -> dict:
+    out = {}
+    for t in tickers:
+        try:
+            h = hist_one(t)
+        except Exception:
+            h = pd.DataFrame()
+        if h is None or h.empty or "Close" not in h.columns or h["Close"].dropna().shape[0] < 2:
+            out[t] = {}
+            continue
+        t_date, t_close, p_date, p_close = last_two(h["Close"])
+
+        def _last(col):
+            if col not in h.columns:
+                return None
+            s = h[col].dropna()
+            return float(s.iloc[-1]) if len(s) else None
+
+        out[t] = {
+            "t_date": t_date,
+            "p_date": p_date,
+            "close": t_close,
+            "prev_close": p_close,
+            "open": _last("Open"),
+            "high": _last("High"),
+            "low": _last("Low"),
+            "volume": _last("Volume"),
+        }
+        time.sleep(0.15)
     return out
 
+def hk_ticker(code4: str) -> str:
+    return f"{int(str(code4)):04d}.HK"
+
+
+# ========= Main =========
 def main():
     svc = gsheet_service()
 
-    col_a = fetch_col_a_values(svc, max_rows=260)
-    tw_rows, hk_rows = find_stock_rows_from_sheet(col_a)
+    # Read A column (enough rows to cover blocks)
+    a1 = f"'{GSHEET_TAB}'!A1:A200"
+    resp = sheet_values_get(svc, a1)
+    col_a = [r[0] if r else "" for r in resp.get("values", [])]
 
-    tw_codes = [code for _, code in tw_rows]
-    hk_codes = []
-    for _, code in hk_rows:
-        c = str(code).strip().replace(".HK", "")
-        c = c.zfill(4)
-        hk_codes.append(c)
+    tw_rows, hk_rows = find_stock_rows_from_col_a(col_a)
 
-    # HK stocks & indices still use yfinance; TW stocks use TWSE/TPEx official endpoints (avoid Yahoo 404)
+    # Determine latest 2 TW trade dates (for turnover and TWSE daily quotes)
+    tw_today_dt, tw_prev_dt = latest_two_tw_trade_dates()
+    tw_today_yi = twse_turnover_yi(tw_today_dt)
+    tw_prev_yi = twse_turnover_yi(tw_prev_dt)
+
+    # TWSE daily quotes for the 2 dates
+    tw_q_today = parse_twse_quotes(fetch_twse_mi_index(tw_today_dt))
+    tw_q_prev = parse_twse_quotes(fetch_twse_mi_index(tw_prev_dt))
+
+    # HK stocks via Yahoo
+    hk_codes = [code4 for _, code4 in hk_rows]
     hk_tickers = [hk_ticker(c) for c in hk_codes]
+    hk_map = build_yahoo_ohlcv_map(hk_tickers)
 
-    tw_map  = build_tw_stock_map(tw_codes, now)
-    hk_map  = build_ohlcv_map(hk_tickers)
-    idx_map = build_ohlcv_map([TICKER_TWII, TICKER_HSI])
-
-
-    now = datetime.now()
-
-    # ===== Indices =====
+    # Indices via Yahoo (best-effort)
+    idx_map = build_yahoo_ohlcv_map([TICKER_TWII, TICKER_HSI])
     twii = idx_map.get(TICKER_TWII, {})
-    hsi  = idx_map.get(TICKER_HSI, {})
+    hsi = idx_map.get(TICKER_HSI, {})
 
+    # HK turnover by HKEX (align by HSI trade dates if we have them; else use today/prev by TW calendar as fallback)
+    hk_today_dt = None
+    hk_prev_dt = None
+    if isinstance(hsi.get("t_date"), pd.Timestamp) and not pd.isna(hsi.get("t_date")):
+        hk_today_dt = hsi["t_date"].to_pydatetime()
+    if isinstance(hsi.get("p_date"), pd.Timestamp) and not pd.isna(hsi.get("p_date")):
+        hk_prev_dt = hsi["p_date"].to_pydatetime()
+    if hk_today_dt is None:
+        hk_today_dt = datetime.now()
+    if hk_prev_dt is None:
+        hk_prev_dt = hk_today_dt - timedelta(days=1)
+
+    hk_today_yi, hk_prev_yi = get_two_hk_turnover_by_dates(hk_today_dt, hk_prev_dt)
+
+    # Build batch updates (write only non-formula cells)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     updates = []
-    # L3：時間戳
-    updates.append(("L3", now))
 
-    # D6/E6：TWII close/prev
-    updates.append(("D6", _round2(twii.get("close"))))
-    updates.append(("E6", _round2(twii.get("prev_close"))))
+    def _put(cell: str, value):
+        updates.append({"range": f"'{GSHEET_TAB}'!{cell}", "values": [[value]]})
 
-    # D8/E8：HSI close/prev
-    updates.append(("D8", _round2(hsi.get("close"))))
-    updates.append(("E8", _round2(hsi.get("prev_close"))))
+    # Timestamp
+    _put("L3", now)
 
-    # H6/I6：台股成交額（億元），用 TWII 的交易日去對齊
-    tw_t_date = twii.get("t_date")
-    tw_p_date = twii.get("p_date")
-    try:
-        h = hist_one(TICKER_TWII)
-        t_date, _, p_date, _ = last_two(h["Close"])
-        tw_t_date, tw_p_date = t_date, p_date
-    except Exception:
-        pass
+    # Indices
+    _put("D6", _round2(twii.get("close")) if twii else None)
+    _put("E6", _round2(twii.get("prev_close")) if twii else None)
+    _put("H6", tw_today_yi)
+    _put("I6", tw_prev_yi)
 
-    tw_today_yi = twse_turnover_yi(tw_t_date.to_pydatetime()) if isinstance(tw_t_date, pd.Timestamp) else None
-    tw_prev_yi  = twse_turnover_yi(tw_p_date.to_pydatetime()) if isinstance(tw_p_date, pd.Timestamp) else None
-    updates.append(("H6", tw_today_yi))
-    updates.append(("I6", tw_prev_yi))
+    _put("D8", _round2(hsi.get("close")) if hsi else None)
+    _put("E8", _round2(hsi.get("prev_close")) if hsi else None)
+    _put("H8", hk_today_yi)
+    _put("I8", hk_prev_yi)
 
-    # H8/I8：港股成交額（億港幣）
-    hk_today_yi, hk_prev_yi = get_two_hk_turnover_by_dates(hsi.get("t_date"), hsi.get("p_date"))
-    updates.append(("H8", hk_today_yi))
-    updates.append(("I8", hk_prev_yi))
-
-    # ===== Stocks：只寫你原本要餵公式的欄位（D/E/H/I/J/K）=====
-    # 台股：成交張數 = volume/1000
-    for (r, code) in tw_rows:
-        d = tw_map.get(code, {})
-        close = _round2(d.get("close"))
-        prev  = _round2(d.get("prev_close"))
-        opn   = _round2(d.get("open"))
-        low   = _round2(d.get("low"))
-        high  = _round2(d.get("high"))
-        vol   = d.get("volume")
-
+    # TW stocks -> from TWSE quotes
+    for r, code in tw_rows:
+        today = tw_q_today.get(code, {})
+        prev = tw_q_prev.get(code, {})
+        close = _round2(today.get("close"))
+        prev_close = _round2(prev.get("close"))
+        opn = _round2(today.get("open"))
+        low = _round2(today.get("low"))
+        high = _round2(today.get("high"))
+        vol_shares = today.get("volume_shares")
         lots = None
-        if not _isnan(vol):
-            lots = int(round(float(vol) / 1000))
+        if vol_shares is not None:
+            try:
+                lots = int(round(int(vol_shares) / 1000))
+            except Exception:
+                lots = None
 
-        updates += [
-            (a1("D", r), close),
-            (a1("E", r), prev),
-            (a1("H", r), opn),
-            (a1("I", r), low),
-            (a1("J", r), high),
-            (a1("K", r), lots),
-        ]
+        # Write D:E and H:K (keep F/G/L formulas untouched)
+        updates.append({"range": f"'{GSHEET_TAB}'!D{r}:E{r}", "values": [[close, prev_close]]})
+        updates.append({"range": f"'{GSHEET_TAB}'!H{r}:K{r}", "values": [[opn, low, high, lots]]})
 
-    # 港股：這裡先用 “手數=volume/1000” 當保守預設（你若有 hk_lot.csv 也可再加回去）
-    for (r, _raw), code, ticker in zip(hk_rows, hk_codes, hk_tickers):
+    # HK stocks -> from Yahoo
+    default_lot = 1000
+    for (r, code4), ticker in zip(hk_rows, hk_tickers):
         d = hk_map.get(ticker, {})
         close = _round2(d.get("close"))
-        prev  = _round2(d.get("prev_close"))
-        opn   = _round2(d.get("open"))
-        low   = _round2(d.get("low"))
-        high  = _round2(d.get("high"))
-        vol   = d.get("volume")
-
+        prev_close = _round2(d.get("prev_close"))
+        opn = _round2(d.get("open"))
+        low = _round2(d.get("low"))
+        high = _round2(d.get("high"))
+        vol = d.get("volume")
         hands = None
-        if not _isnan(vol):
-            hands = int(round(float(vol) / 1000))
+        if vol is not None and not _isnan(vol):
+            try:
+                hands = int(round(float(vol) / default_lot))
+            except Exception:
+                hands = None
 
-        updates += [
-            (a1("D", r), close),
-            (a1("E", r), prev),
-            (a1("H", r), opn),
-            (a1("I", r), low),
-            (a1("J", r), high),
-            (a1("K", r), hands),
-        ]
+        updates.append({"range": f"'{GSHEET_TAB}'!D{r}:E{r}", "values": [[close, prev_close]]})
+        updates.append({"range": f"'{GSHEET_TAB}'!H{r}:K{r}", "values": [[opn, low, high, hands]]})
 
-    # 一次寫回
-    batch_update(svc, updates)
+    # Execute update
+    sheet_values_batch_update(svc, updates, value_input_option="USER_ENTERED")
 
     print("DONE: updated Google Sheet")
     print(f"TW rows: {len(tw_rows)} | HK rows: {len(hk_rows)}")
+    print(f"TW dates: {tw_today_dt.date()} / {tw_prev_dt.date()}")
     print(f"TWII turnover (today/prev, 億元): {tw_today_yi} / {tw_prev_yi}")
     print(f"HK turnover (today/prev, 億港幣): {hk_today_yi} / {hk_prev_yi}")
+
 
 if __name__ == "__main__":
     main()
