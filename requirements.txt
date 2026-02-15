@@ -1,0 +1,9 @@
+pandas
+openpyxl
+yfinance
+requests
+beautifulsoup4
+lxml
+python-dotenv
+tenacity
+certifi
