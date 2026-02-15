@@ -116,7 +116,7 @@ def resolve_tw_ticker(code: str, cache: dict) -> str:
     if code in cache:
         return f"{code}.{cache[code]}"
 
-    for suf in ["TWO", "TW"]:
+    for suf in ["TW", "TWO"]:
         t = f"{code}.{suf}"
         try:
             h = hist_one(t)
