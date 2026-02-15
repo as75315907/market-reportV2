@@ -160,15 +160,31 @@ def read_hk_lot_map() -> dict:
 
 # ========= 寄信 =========
 def send_email_with_attachment(subject, body, attachment_path):
-    load_dotenv()
-    host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "465"))
-    user = os.getenv("SMTP_USER")
-    app_pw = os.getenv("SMTP_APP_PASSWORD")
-    mail_to = os.getenv("MAIL_TO")
+    """
+    本機可用 .env；GitHub Actions 用環境變數/Secrets。
+    若 SMTP 相關環境變數不齊，就直接跳過寄信（不讓整個流程失敗）。
+    """
+    # 本機若有 .env 才載入；Actions 沒 .env 也不會出錯
+    try:
+        load_dotenv()
+    except Exception:
+        pass
 
-    if not all([host, port, user, app_pw, mail_to]):
-        raise RuntimeError("請先在 .env 設定 SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_APP_PASSWORD/MAIL_TO")
+    host = os.getenv("SMTP_HOST", "").strip()
+    port_s = os.getenv("SMTP_PORT", "465").strip()
+    user = os.getenv("SMTP_USER", "").strip()
+    app_pw = os.getenv("SMTP_APP_PASSWORD", "").strip()
+    mail_to = os.getenv("MAIL_TO", "").strip()
+
+    # Actions 沒設定就跳過（避免 exit code 1）
+    if not (host and port_s and user and app_pw and mail_to):
+        print("[INFO] SMTP env not set. Skip sending email.")
+        return
+
+    try:
+        port = int(port_s)
+    except Exception:
+        port = 465
 
     msg = EmailMessage()
     msg["Subject"] = subject
