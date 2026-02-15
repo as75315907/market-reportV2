@@ -24,6 +24,9 @@ jobs:
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
       MAIL_TO: ${{ secrets.MAIL_TO }}
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
     steps:
       - name: Checkout
@@ -52,7 +55,7 @@ jobs:
       - name: Run report
         run: |
           rm -f tw_suffix_cache.json
-          python daily_market_report_turnover_twse_fmtqik_hkex_v3_fixhk6_dailyoverwrite.py
+          python daily_market_report_to_gsheet.py
           ls -la reports
 
       - name: Upload artifact
