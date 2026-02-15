@@ -2,8 +2,15 @@ name: Market Report to Google Sheet (Mon-Fri 17:30 Taipei)
 
 on:
   schedule:
-    - cron: "30 9 * * 1-5"  # 09:30 UTC = 17:30 Asia/Taipei
+    - cron: "30 9 * * 1-5"   # 17:30 Asia/Taipei
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-report
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -11,6 +18,7 @@ jobs:
     env:
       TZ: Asia/Taipei
       DEBUG_HKEX: "0"
+
       GSHEET_ID: ${{ secrets.GSHEET_ID }}
       GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
       GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
