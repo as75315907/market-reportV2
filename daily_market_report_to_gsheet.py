@@ -549,12 +549,16 @@ def find_stock_rows_from_sheet(col_a: list[str], col_b: list[str]):
 
 # ========= Revenue (營收) =========
 REV_TAB_DEFAULT = "營收"
+
+# 上市 / 上櫃（MOPSFIN CSV）
 MOPSFIN_LISTED_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv"
 MOPSFIN_OTC_CSV    = "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv"
 
+# 興櫃（TPEX OpenAPI）
+TPEX_EMERGING_JSON = "https://www.tpex.org.tw/openapi/v1/t187ap05_R"
+
 def _ym_add(year: int, month: int, delta_months: int) -> tuple[int, int]:
-    y, m = year, month
-    m = m + delta_months
+    y, m = year, month + delta_months
     while m <= 0:
         y -= 1
         m += 12
@@ -567,22 +571,26 @@ def _ym_label(year: int, month: int) -> str:
     return f"{year}/{month:02d}月"
 
 def _parse_ym_any(v) -> tuple[int, int] | None:
+    """支援 ROC yyyMM（如11501）或 AD yyyyMM（如202601）"""
     if v is None:
         return None
     s = re.sub(r"\D", "", str(v))
     if not s:
         return None
-    # ROC yyyMM (5 digits) or AD yyyyMM (6 digits)
-    if len(s) == 5:
+    if len(s) == 5:  # ROC yyyMM
         roc_y = int(s[:3])
         m = int(s[3:])
-        return (roc_y + 1911, m)
-    if len(s) >= 6:
+        if 1 <= m <= 12:
+            return (roc_y + 1911, m)
+    if len(s) >= 6:  # AD yyyyMM
         y = int(s[:4])
         m = int(s[4:6])
         if 1 <= m <= 12:
             return (y, m)
     return None
+
+def _clean_colname(c: str) -> str:
+    return str(c).strip().replace("\ufeff", "")
 
 def _find_colname(cols: list[str], includes: list[str], excludes: list[str] = None) -> str | None:
     excludes = excludes or []
@@ -596,22 +604,46 @@ def _download_csv_to_df(url: str) -> pd.DataFrame:
     r = _SESSION.get(url, timeout=40)
     r.raise_for_status()
     text = r.content.decode("utf-8-sig", errors="ignore")
-    return pd.read_csv(StringIO(text), dtype=str)
+    df = pd.read_csv(StringIO(text), dtype=str)
+    df.columns = [_clean_colname(c) for c in df.columns]
+    return df
 
-def fetch_monthly_revenue_maps() -> tuple[tuple[int, int] | None, dict]:
+def _download_json_to_df(url: str) -> pd.DataFrame:
+    r = _SESSION.get(url, timeout=40, headers={"User-Agent": UA})
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if not isinstance(data, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df.columns = [_clean_colname(c) for c in df.columns]
+    return df
+
+def fetch_monthly_revenue_maps_all() -> tuple[tuple[int, int] | None, dict]:
     """
     Return: (dataset_ym, revenue_map)
     revenue_map[code] = {"this": float, "last_year": float, "last_month": float}
-    Unit: NTD thousand (仟元) as provided by dataset.
+    Unit: 新台幣仟元（依資料源）
     """
     frames = []
+
+    # L/O: CSV
     for url in (MOPSFIN_LISTED_CSV, MOPSFIN_OTC_CSV):
         try:
             df = _download_csv_to_df(url)
             if df is not None and not df.empty:
                 frames.append(df)
         except Exception:
-            continue
+            pass
+
+    # R: JSON (興櫃)
+    try:
+        df_r = _download_json_to_df(TPEX_EMERGING_JSON)
+        if df_r is not None and not df_r.empty:
+            frames.append(df_r)
+    except Exception:
+        pass
 
     if not frames:
         return None, {}
@@ -619,16 +651,25 @@ def fetch_monthly_revenue_maps() -> tuple[tuple[int, int] | None, dict]:
     df = pd.concat(frames, ignore_index=True)
     cols = list(df.columns)
 
-    code_col = _find_colname(cols, ["公司", "代號"]) or _find_colname(cols, ["證券", "代號"]) or _find_colname(cols, ["公司代碼"])
-    ym_col   = _find_colname(cols, ["資料", "年月"]) or _find_colname(cols, ["資料年月"]) or _find_colname(cols, ["年月"])
+    code_col = (
+        _find_colname(cols, ["公司", "代號"])
+        or _find_colname(cols, ["證券", "代號"])
+        or _find_colname(cols, ["公司代碼"])
+    )
+    ym_col = _find_colname(cols, ["資料", "年月"]) or _find_colname(cols, ["資料年月"]) or _find_colname(cols, ["年月"])
 
     this_col = _find_colname(cols, ["當月營收"], excludes=["累計"])
-    lastm_col= _find_colname(cols, ["上月營收"], excludes=["累計"])
-    lasty_col= _find_colname(cols, ["去年當月營收"], excludes=["累計"]) or _find_colname(cols, ["去年同期營收"], excludes=["累計"])
+    lastm_col = _find_colname(cols, ["上月營收"], excludes=["累計"])
+    lasty_col = (
+        _find_colname(cols, ["去年當月營收"], excludes=["累計"])
+        or _find_colname(cols, ["去年同期營收"], excludes=["累計"])
+    )
 
     if not code_col or not this_col or not lastm_col or not lasty_col:
+        # 欄位名若改版，至少不要默默錯；回空讓你看到問題
         return None, {}
 
+    # dataset_ym 取資料中最大年月（用來決定表頭月份）
     dataset_ym = None
     if ym_col:
         yms = []
@@ -645,17 +686,16 @@ def fetch_monthly_revenue_maps() -> tuple[tuple[int, int] | None, dict]:
         code = re.sub(r"\D", "", code)
         if not code:
             continue
-        this_v = _to_float(row.get(this_col))
-        lasty_v= _to_float(row.get(lasty_col))
-        lastm_v= _to_float(row.get(lastm_col))
-        if this_v is None and lasty_v is None and lastm_v is None:
-            continue
-        rev_map[code] = {"this": this_v, "last_year": lasty_v, "last_month": lastm_v}
+        rev_map[code] = {
+            "this": _to_float(row.get(this_col)),
+            "last_year": _to_float(row.get(lasty_col)),
+            "last_month": _to_float(row.get(lastm_col)),
+        }
 
     return dataset_ym, rev_map
 
 def find_revenue_rows_from_sheet(col_a: list[str]):
-    # Revenue sheet layout: row2 is header, data starts row3; col A has codes.
+    # 你的營收表：A2是標題，A3起是代碼；遇到空白停止
     rows = []
     for r in range(3, 260 + 1):
         idx = r - 1
@@ -664,7 +704,6 @@ def find_revenue_rows_from_sheet(col_a: list[str]):
         v = (col_a[idx] or "").strip()
         if v == "":
             break
-        # might be like "2926.0" if read as float
         v2 = re.sub(r"[^\d]", "", v)
         if v2.isdigit():
             rows.append((r, v2))
@@ -676,30 +715,37 @@ def update_revenue_tab(svc, sheet_id: str):
 
     ab = get_values(svc, sheet_id, f"{tab_q}!A1:B260")
     col_a = [row[0] if len(row) > 0 else "" for row in ab]
-
     rows = find_revenue_rows_from_sheet(col_a)
 
-    # Decide the reference month (usually previous month of today), but align to dataset month if available.
+    # 預期月份 = 上一個月（例如 2026/2/15 -> 2026/01）
     now = _today_taipei()
     exp_y, exp_m = _ym_add(now.year, now.month, -1)
 
-    dataset_ym, rev_map = fetch_monthly_revenue_maps()
-    use_y, use_m = (dataset_ym if dataset_ym else (exp_y, exp_m))
+    dataset_ym, rev_map = fetch_monthly_revenue_maps_all()
 
-    # Headers:
-    # C2 = use_y/use_m
-    # D2 = use_y-1/use_m
-    # F2 = use_y/use_m - 1 month
+    # 表頭月份：若資料源還沒更新，就以「實際資料最新年月」為準，避免整批抓不到
+    use_y, use_m = (dataset_ym if dataset_ym else (exp_y, exp_m))
     y_ly, m_ly = use_y - 1, use_m
     y_lm, m_lm = _ym_add(use_y, use_m, -1)
 
     updates = []
+    # 你的表頭位置：C2 / D2 / F2
     updates.append((f"{tab_q}!C2", [[_ym_label(use_y, use_m)]]))
     updates.append((f"{tab_q}!D2", [[_ym_label(y_ly, m_ly)]]))
     updates.append((f"{tab_q}!F2", [[_ym_label(y_lm, m_lm)]]))
 
+    # 寫入：C(當月) / D(去年同月) / F(上月)
+    missing = []
     for r, code in rows:
-        d = rev_map.get(code, {})
+        d = rev_map.get(code)
+        if not d:
+            missing.append(code)
+            # 留空，讓公式顯示 #DIV/0! 也能提醒你缺資料（或你要改成 0 也可）
+            updates.append((f"{tab_q}!C{r}", [[None]]))
+            updates.append((f"{tab_q}!D{r}", [[None]]))
+            updates.append((f"{tab_q}!F{r}", [[None]]))
+            continue
+
         updates.append((f"{tab_q}!C{r}", [[d.get("this")]]))
         updates.append((f"{tab_q}!D{r}", [[d.get("last_year")]]))
         updates.append((f"{tab_q}!F{r}", [[d.get("last_month")]]))
@@ -708,6 +754,8 @@ def update_revenue_tab(svc, sheet_id: str):
         batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
 
     print(f"Revenue tab updated: {tab} | month={use_y}-{use_m:02d} | rows={len(rows)}")
+    if missing:
+        print("Revenue missing codes:", ", ".join(missing))
 
 
 # ========= Main =========
