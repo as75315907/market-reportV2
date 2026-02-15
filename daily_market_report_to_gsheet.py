@@ -583,96 +583,145 @@ def _a1(col: int, row: int) -> str:
 
 def find_stock_rows_from_sheet(grid: List[List[Any]]) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
     """
-    Scan a 2D grid (rows x cols) and find TW/HK sections, then extract codes from column A.
+    從 Google Sheet 的 A1:Z? 2D grid 解析「台股/港股」個股區塊的列號與代碼。
 
-    Why this version:
-    - In Google Sheet, column A might be "2926-誠品生活" (not pure digits). We extract leading digits.
-    - Header might be in any column, and may include spaces/line breaks.
-    - Works even if header order is reversed.
-
-    Returns:
-      tw_rows: [(row_index_1based, "2926"), ...]
-      hk_rows: [(row_index_1based, "0005"), ...]  (4-digit)
+    你這張版面上方還有「大盤收盤資料」(台股/香港恆生 + (台幣)/(港幣))，
+    會讓單純用包含關鍵字的方式誤判 header 列，導致 TW rows=0。
+    這裡改成：
+    1) 先定位「個股資料」區塊起始列（避免抓到上方大盤表）。
+    2) 再在其下方找「台股（台幣）」與「港股（港幣）」標題列（允許括號/空白/換行差異）。
+    3) 台股：抓 4~6 位數代碼；港股：抓 xxxx.HK / xxxxx.HK 形式。
     """
-    tw_header = None
-    hk_header = None
+    # ----- helpers -----
+    def _norm(x: Any) -> str:
+        s = "" if x is None else str(x)
+        return s.replace("\u00a0", " ").strip()
 
-    # --- locate headers anywhere in the row ---
-    for i, row in enumerate(grid, start=1):
-        joined = _norm_text("".join(str(c) for c in row if c is not None))
-        if tw_header is None and ("台股" in joined and "台幣" in joined):
-            tw_header = i
-        if hk_header is None and ("港股" in joined and "港幣" in joined):
-            hk_header = i
+    def _row_text(r: int) -> str:
+        return " ".join(_norm(c) for c in grid[r] if _norm(c))
 
-    if tw_header is None or hk_header is None:
-        preview_lines = []
-        for r in range(1, min(61, len(grid) + 1)):
-            row = grid[r - 1] if r - 1 < len(grid) else []
-            preview_lines.append(f"{r:03d}: " + " | ".join(str(x) for x in (row[:8] if row else [])))
-        raise RuntimeError(
-            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。\n"
-            + "\n".join(preview_lines)
-        )
+    def _cell_has(s: str, *keys: str) -> bool:
+        s2 = s.replace(" ", "")
+        return all(k.replace(" ", "") in s2 for k in keys)
 
-    def _extract_tw_code(a_val: str) -> Optional[str]:
-        s = str(a_val or "").strip()
-        # accept: "2926", "2926.TW", "2926-誠品生活", "2926 誠品生活"
+    def _is_good_section_header(s: str, must1: str, must2: str) -> bool:
+        # 避免抓到「208.01億（台幣）」這種含數字/億的 cell
+        if not _cell_has(s, must1, must2):
+            return False
+        if re.search(r"\d", s):
+            return False
+        if "億" in s:
+            return False
+        # 太長通常不是 section header
+        return len(s) <= 30
+
+    def _find_anchor_row() -> int:
+        # 先找「個股資料」，找不到就回傳 0（仍可 fallback）
+        for r in range(min(len(grid), 200)):
+            txt = _row_text(r)
+            if "個股資料" in txt:
+                return r
+        return 0
+
+    def _find_header_row(after_r: int, kind: str) -> int | None:
+        # kind: "tw" or "hk"
+        must = ("台股", "台幣") if kind == "tw" else ("港股", "港幣")
+        for r in range(after_r, min(len(grid), after_r + 200)):
+            for c in range(min(len(grid[r]), 26)):
+                cell = _norm(grid[r][c])
+                if not cell:
+                    continue
+                # 容許括號/全半形/換行，例如 台股（台幣）、台股 (台幣)、台股\n(台幣)
+                cell2 = cell.replace("\n", "").replace("（", "(").replace("）", ")")
+                if _is_good_section_header(cell2, must[0], must[1]):
+                    return r
+        return None
+
+    def _tw_code_from_a(val: Any) -> str | None:
+        s = _norm(val)
         m = re.match(r"^(\d{4,6})", s)
         return m.group(1) if m else None
 
-    def _extract_hk_code(a_val: str) -> Optional[str]:
-        s = str(a_val or "").strip()
-        s = s.replace(".HK", "").replace("HK", "").strip()
-        m = re.match(r"^(\d{1,5})", s)  # HK codes can be 1-5 digits; we'll zfill(4)
-        return m.group(1).zfill(4) if m else None
+    def _hk_code_from_a(val: Any) -> str | None:
+        s = _norm(val).upper()
+        # 03368.HK / 0825.HK / 825.HK
+        m = re.match(r"^0*([0-9]{1,5})\.HK$", s)
+        if m:
+            return m.group(1).zfill(4) if len(m.group(1)) <= 4 else m.group(1).zfill(5)
+        # 也容許寫成 03368HK / 0825HK
+        m = re.match(r"^0*([0-9]{1,5})HK$", s)
+        if m:
+            return m.group(1).zfill(4) if len(m.group(1)) <= 4 else m.group(1).zfill(5)
+        return None
 
-    def _read_codes_down(start_row: int, stop_row: Optional[int], kind: str) -> List[Tuple[int, str]]:
+    def _read_codes_down(start_row_1based: int, end_row_1based: int | None, kind: str) -> List[Tuple[int, str]]:
         out: List[Tuple[int, str]] = []
-        r = start_row
-        blanks = 0
-        while True:
-            if stop_row is not None and r >= stop_row:
-                break
-            if r > len(grid):
-                break
-
-            a_val = ""
-            try:
-                a_val = str(grid[r - 1][0]).strip() if len(grid[r - 1]) > 0 else ""
-            except Exception:
-                a_val = ""
-
-            if a_val == "" or a_val.lower() == "none":
-                blanks += 1
-                if blanks >= 3:
-                    break
-                r += 1
-                continue
-            blanks = 0
-
-            if kind == "tw":
-                code = _extract_tw_code(a_val)
-            else:
-                code = _extract_hk_code(a_val)
-
+        blank_streak = 0
+        r1 = start_row_1based
+        r2 = end_row_1based if end_row_1based is not None else len(grid)
+        for rr in range(r1, min(r2, len(grid) + 1)):
+            a = grid[rr - 1][0] if len(grid[rr - 1]) >= 1 else ""
+            code = _tw_code_from_a(a) if kind == "tw" else _hk_code_from_a(a)
             if code:
-                out.append((r, code))
-            r += 1
+                out.append((rr, code))
+                blank_streak = 0
+                continue
+            # 遇到空白代碼列，累積 3 次就結束（避免掃到很下面）
+            if _norm(a) == "":
+                blank_streak += 1
+                if blank_streak >= 3 and out:
+                    break
+            else:
+                blank_streak = 0
         return out
 
-    if tw_header < hk_header:
-        tw_rows = _read_codes_down(tw_header + 1, hk_header, "tw")
-        hk_rows = _read_codes_down(hk_header + 1, None, "hk")
-    else:
-        hk_rows = _read_codes_down(hk_header + 1, tw_header, "hk")
-        tw_rows = _read_codes_down(tw_header + 1, None, "tw")
+    # ----- main logic -----
+    anchor = _find_anchor_row()
+
+    tw_header = _find_header_row(anchor, "tw")
+    hk_header = _find_header_row(anchor, "hk")
+
+    # fallback：若找不到 header，就以 A 欄格式推斷區塊（保底）
+    if tw_header is None:
+        # 找第一個 4 位數台股代碼列
+        for r in range(anchor, min(len(grid), anchor + 200)):
+            code = _tw_code_from_a(grid[r][0] if grid[r] else "")
+            if code:
+                tw_header = r - 1  # 讓 start=tw_header+1 落在 code 列
+                break
+
+    if hk_header is None:
+        for r in range(anchor, min(len(grid), anchor + 300)):
+            code = _hk_code_from_a(grid[r][0] if grid[r] else "")
+            if code:
+                hk_header = r - 1
+                break
+
+    if tw_header is None or hk_header is None:
+        raise RuntimeError("找不到『台股（台幣）』或『港股（港幣）』區塊，請確認分頁版面 / 欄位是否變更。")
+
+    # 確保 hk_header 在 tw_header 之後（避免顛倒）
+    if hk_header <= tw_header:
+        # 嘗試在 tw_header 之後重新找 hk header
+        hk_header2 = _find_header_row(tw_header + 1, "hk")
+        if hk_header2 is not None:
+            hk_header = hk_header2
+        else:
+            # 最後保底：找第一個 .HK 代碼列
+            for r in range(tw_header + 1, min(len(grid), tw_header + 400)):
+                code = _hk_code_from_a(grid[r][0] if grid[r] else "")
+                if code:
+                    hk_header = r - 1
+                    break
+
+    # 台股代碼列：從 tw_header 下一列開始，到 hk_header（不含）為止
+    tw_rows = _read_codes_down(tw_header + 2, hk_header + 1, "tw")
+    # 港股代碼列：從 hk_header 下一列開始到底
+    hk_rows = _read_codes_down(hk_header + 2, None, "hk")
 
     return tw_rows, hk_rows
 
 
-
-# ====== Main ======
 def main():
     gsheet_id = os.getenv("GSHEET_ID", "").strip()
     tab = os.getenv("GSHEET_TAB", "").strip() or "IR_updated (PC HOME)"
