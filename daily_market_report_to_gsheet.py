@@ -267,42 +267,94 @@ def fetch_col_a_values(svc, max_rows=250):
             out.append("")
     return out  # index 0 => row 1
 
-def find_stock_rows_from_sheet(col_a: List[str]) -> Tuple[List[Tuple[int,str]], List[Tuple[int,str]]]:
-    """
-    依你 excel 模板的找法：先找「台股（台幣）」與「港股（港幣）」標題列，
-    然後往下抓代碼直到遇到空白。
-    """
-    tw_start = None
-    hk_start = None
-    for idx, v in enumerate(col_a, start=1):
-        s = str(v).strip()
-        if tw_start is None and "台股" in s and "台幣" in s:
-            tw_start = idx + 1
-        if hk_start is None and "港股" in s and "港幣" in s:
-            hk_start = idx + 1
 
-    if tw_start is None or hk_start is None:
-        raise RuntimeError("找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面")
+def fetch_grid_values(svc, max_rows: int = 300, max_cols: int = 26):
+    """讀取 A1:Z{max_rows}（預設），回傳 list[list[str]]，不足的補空字串。"""
+    # A..Z = 26 cols
+    last_col = chr(ord('A') + max_cols - 1)
+    rng = f"'{GSHEET_TAB}'!A1:{last_col}{max_rows}"
+    res = svc.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=rng).execute()
+    vals = res.get("values", [])  # list[list[str]]
+    grid = []
+    for r in range(max_rows):
+        row = []
+        if r < len(vals):
+            src = vals[r]
+        else:
+            src = []
+        for c in range(max_cols):
+            if c < len(src):
+                row.append(str(src[c]))
+            else:
+                row.append("")
+        grid.append(row)
+    return grid  # index 0 => row 1
 
+def _norm_cell(s: str) -> str:
+    """統一括號/空白/換行，方便比對標題。"""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"\s+", "", s)  # 移除所有空白/換行
+    return s
+
+def find_stock_rows_from_sheet(grid_values):
+    """
+    從 Google Sheet 版面找出台股/港股區段（比 Excel 模板更寬鬆、更耐用）：
+
+    - 掃描 A1:Z300（或你傳入的 grid_values）每一列所有欄位，找包含：
+        * 「台股」且「台幣」 => 台股標題列
+        * 「港股」且「港幣」 => 港股標題列
+      （不要求括號一模一樣；不怕空白/換行/星號）
+
+    - 股票代碼仍以 A 欄為準：
+        * 台股：從台股標題下一列開始，往下到港股標題上一列（或遇到空白停止）
+        * 港股：從港股標題下一列開始，往下直到遇到空白停止
+    """
+    if not grid_values:
+        raise RuntimeError("Sheet 讀回來是空的（values 空白）")
+
+    tw_header_row = None
+    hk_header_row = None
+
+    for i, row in enumerate(grid_values, start=1):  # 1-based row
+        joined = _norm_cell("".join([str(x) for x in row if x is not None]))
+        if tw_header_row is None and ("台股" in joined and "台幣" in joined):
+            tw_header_row = i
+        if hk_header_row is None and ("港股" in joined and "港幣" in joined):
+            hk_header_row = i
+
+    if tw_header_row is None or hk_header_row is None:
+        # 顯示前 40 列（前 6 欄）預覽，方便你在 Actions log 直接看是哪裡不一致
+        preview = []
+        for i, row in enumerate(grid_values[:40], start=1):
+            preview.append(f"{i}: " + "|".join([_norm_cell(x) for x in row[:6]]))
+        raise RuntimeError(
+            "找不到『台股（台幣）』或『港股（港幣）』標題列，請確認分頁版面。\n"
+            "前 40 列（前 6 欄）預覽：\n" + "\n".join(preview)
+        )
+
+    # 台股區：從台股標題下一列開始，直到港股標題上一列（或遇空白）
     tw_rows = []
-    r = tw_start
-    while r < hk_start:
-        code = col_a[r-1].strip()
+    for r in range(tw_header_row + 1, hk_header_row):
+        code = str(grid_values[r-1][0]).strip() if (r-1) < len(grid_values) and len(grid_values[r-1]) > 0 else ""
         if not code:
             break
-        if code.isdigit():
-            tw_rows.append((r, code))
-        r += 1
+        code_s = re.sub(r"\D", "", code)
+        if code_s:
+            tw_rows.append((r, code_s))
 
+    # 港股區：從港股標題下一列開始往下（或遇空白）
     hk_rows = []
-    r = hk_start
-    for _ in range(0, 80):
-        code = col_a[r-1].strip()
+    for r in range(hk_header_row + 1, min(hk_header_row + 200, len(grid_values)) + 1):
+        code = str(grid_values[r-1][0]).strip() if (r-1) < len(grid_values) and len(grid_values[r-1]) > 0 else ""
         if not code:
             break
-        code = code.replace(".HK", "").replace("HK", "").strip()
-        hk_rows.append((r, code))
-        r += 1
+        code_s = str(code).replace(".HK", "").replace("HK", "").strip()
+        code_s = re.sub(r"\D", "", code_s)
+        if code_s:
+            hk_rows.append((r, code_s))
 
     return tw_rows, hk_rows
 
@@ -323,8 +375,8 @@ def batch_update(svc, updates: List[Tuple[str, Any]]):
 def main():
     svc = gsheet_service()
 
-    col_a = fetch_col_a_values(svc, max_rows=260)
-    tw_rows, hk_rows = find_stock_rows_from_sheet(col_a)
+    grid = fetch_grid_values(svc, max_rows=300, max_cols=26)
+    tw_rows, hk_rows = find_stock_rows_from_sheet(grid)
 
     cache = load_cache()
     tw_codes = [code for _, code in tw_rows]
