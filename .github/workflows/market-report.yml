@@ -1,8 +1,10 @@
 name: Market Report to Google Sheet (Mon-Fri 17:30 Taipei)
 
 on:
+  # 解法A：提早觸發，避免 GitHub cron 抖動導致 17:30 才開始排隊
+  # 09:00 UTC = 17:00 Asia/Taipei
   schedule:
-    - cron: "30 9 * * 1-5"  # 09:30 UTC = 17:30 Asia/Taipei
+    - cron: "0 9 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -45,6 +47,32 @@ jobs:
           print(info("GCP_SA_JSON"))
           PY
 
+      # ✅ 解法A核心：等到台北 17:30 才開始跑
+      - name: Wait until 17:30 Asia/Taipei
+        shell: bash
+        run: |
+          set -e
+          TARGET_HH="17"
+          TARGET_MM="30"
+
+          echo "Now (Taipei): $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+          TODAY=$(TZ=Asia/Taipei date +%F)
+
+          NOW_TS=$(TZ=Asia/Taipei date +%s)
+          TARGET_TS=$(TZ=Asia/Taipei date -d "${TODAY} ${TARGET_HH}:${TARGET_MM}:00" +%s)
+
+          # 若已經超過 17:30，就不等待（直接執行）
+          if [ "${NOW_TS}" -lt "${TARGET_TS}" ]; then
+            SLEEP_SEC=$((TARGET_TS - NOW_TS))
+            # 安全上限：最多等 3 小時，避免異常卡住
+            if [ "${SLEEP_SEC}" -gt 0 ] && [ "${SLEEP_SEC}" -lt 10800 ]; then
+              echo "Sleeping ${SLEEP_SEC}s to reach ${TODAY} ${TARGET_HH}:${TARGET_MM} Taipei..."
+              sleep "${SLEEP_SEC}"
+            fi
+          fi
+
+          echo "Start run (Taipei): $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+
       - name: Run report -> Google Sheet
         run: |
           rm -f tw_suffix_cache.json
@@ -67,13 +95,11 @@ jobs:
             echo ""
             echo "Google Sheet: ${{ secrets.GSHEET_SHEET_NAME }}"
           } > mail_body.txt
-      
+
           echo "MAIL_BODY<<EOF" >> $GITHUB_ENV
           cat mail_body.txt >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-      
-      
-            
+
       - name: Email on success
         if: success()
         uses: dawidd6/action-send-mail@v3
@@ -105,6 +131,3 @@ jobs:
             Run: ${{ github.run_id }}
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
-
-            請到 GitHub Actions 查看 log：
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
