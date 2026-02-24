@@ -115,6 +115,45 @@ def _today_taipei() -> datetime:
     # GitHub Actions default is UTC; if you need strict Asia/Taipei, convert with zoneinfo.
     return datetime.now()
 
+def _parse_l3_datetime(v) -> datetime | None:
+    """解析 L3 內的更新時間字串；支援你常見格式。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
+
+def should_skip_today_by_l3(svc, sheet_id: str, tab_name: str) -> bool:
+    """
+    True: 今天已更新過 -> 直接跳過
+    可用 env FORCE_RUN=1 強制不跳過（留給手動排查用）
+    """
+    if os.getenv("FORCE_RUN", "0").strip() == "1":
+        print("[DEDUP] FORCE_RUN=1 -> do not skip")
+        return False
+
+    tab_q = f"'{tab_name}'" if re.search(r"[^A-Za-z0-9_]", tab_name) else tab_name
+    v = get_values(svc, sheet_id, f"{tab_q}!L3:L3")
+    last_dt = _parse_l3_datetime(v[0][0]) if (v and v[0]) else None
+
+    if last_dt is None:
+        print("[DEDUP] L3 empty/unparseable -> do not skip")
+        return False
+
+    today = datetime.now().date()  # 你 workflow 已設 TZ=Asia/Taipei
+    if last_dt.date() == today:
+        print(f"[DEDUP] Already updated today at {last_dt} -> skip")
+        return True
+
+    print(f"[DEDUP] Last update {last_dt} not today -> do not skip")
+    return False
+
 
 def _is_blank_cell(v) -> bool:
     if v is None:
@@ -764,6 +803,11 @@ TICKER_HSI  = "^HSI"
 
 def main():
     svc, sheet_id, tab = gsheet_service()
+        # ---- Dedup: skip if already updated today ----
+    if should_skip_today_by_l3(svc, sheet_id, tab):
+        # 告訴 workflow 這次是 skip（避免寄信）
+        Path("skipped.txt").write_text("1", encoding="utf-8")
+        return
     tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
 
     # Detect "first run" (user cleared D/E/H/I/J/K)
