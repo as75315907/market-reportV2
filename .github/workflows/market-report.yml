@@ -70,16 +70,30 @@ jobs:
       - name: Run report -> Google Sheet
         run: |
           rm -f tw_suffix_cache.json
+          rm -f skipped.txt
           python daily_market_report_to_gsheet.py
 
+      # ✅ 去重：Python 若判定今天已更新，會寫 skipped.txt
+      - name: Check skipped
+        if: always()
+        shell: bash
+        run: |
+          if [ -f skipped.txt ]; then
+            echo "SKIPPED=1" >> $GITHUB_ENV
+            echo "This run is skipped (already updated today)."
+          else
+            echo "SKIPPED=0" >> $GITHUB_ENV
+            echo "This run executed update normally."
+          fi
+
       - name: Prepare email body
-        if: success()
+        if: success() && env.SKIPPED != '1'
         run: |
           echo "MAIL_SUBJECT=✅ Daily Market Report 更新成功 - ${{ github.run_id }}" >> $GITHUB_ENV
           {
             echo "✅ 更新成功"
-            echo "更新執行時間（台北）：$(date '+%Y-%m-%d %H:%M:%S %Z')"
-            echo "更新日期（台北）：$(date '+%Y-%m-%d')"
+            echo "更新執行時間（台北）：$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "更新日期（台北）：$(TZ=Asia/Taipei date '+%Y-%m-%d')"
             echo ""
             echo "Repo: ${{ github.repository }}"
             echo "Workflow: ${{ github.workflow }}"
@@ -95,7 +109,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       - name: Email on success
-        if: success()
+        if: success() && env.SKIPPED != '1'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.MAIL_HOST }}
@@ -107,6 +121,7 @@ jobs:
           from: ${{ secrets.MAIL_USER }}
           body: ${{ env.MAIL_BODY }}
 
+      # ✅ Skip 的情況不寄失敗信（因為不會是 failure()）
       - name: Email on failure
         if: failure()
         uses: dawidd6/action-send-mail@v3
