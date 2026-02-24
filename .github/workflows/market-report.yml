@@ -1,8 +1,11 @@
-name: Market Report to Google Sheet (Mon-Fri 17:30 Taipei)
+name: Market Report to Google Sheet (Mon-Fri by 17:00 Taipei)
 
 on:
+  # 目標：17:00 前完成更新
+  # 16:00 + 16:15 台北兩次觸發（備援），搭配 Python 的 L3 去重避免重複跑
   schedule:
-    - cron: "0 9 * * 1-5"  # 09:00 UTC = 17:00 Asia/Taipei (解法A：提早觸發)
+    - cron: "0 8 * * 1-5"    # 08:00 UTC = 16:00 Asia/Taipei
+    - cron: "15 8 * * 1-5"   # 08:15 UTC = 16:15 Asia/Taipei
   workflow_dispatch:
 
 jobs:
@@ -45,35 +48,13 @@ jobs:
           print(info("GCP_SA_JSON"))
           PY
 
-      - name: Wait until 17:30 Asia/Taipei
-        shell: bash
-        run: |
-          set -e
-          echo "Now (Taipei): $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
-          TODAY=$(TZ=Asia/Taipei date +%F)
-
-          NOW_TS=$(TZ=Asia/Taipei date +%s)
-          TARGET_TS=$(TZ=Asia/Taipei date -d "${TODAY} 17:30:00" +%s)
-
-          if [ "${NOW_TS}" -lt "${TARGET_TS}" ]; then
-            SLEEP_SEC=$((TARGET_TS - NOW_TS))
-            if [ "${SLEEP_SEC}" -gt 0 ] && [ "${SLEEP_SEC}" -lt 10800 ]; then
-              echo "Sleeping ${SLEEP_SEC}s until ${TODAY} 17:30 Taipei..."
-              sleep "${SLEEP_SEC}"
-            fi
-          else
-            echo "Already past 17:30 Taipei, continue."
-          fi
-
-          echo "Start run (Taipei): $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S %Z')"
-
       - name: Run report -> Google Sheet
+        timeout-minutes: 30
         run: |
           rm -f tw_suffix_cache.json
           rm -f skipped.txt
           python daily_market_report_to_gsheet.py
 
-      # ✅ 去重：Python 若判定今天已更新，會寫 skipped.txt
       - name: Check skipped
         if: always()
         shell: bash
@@ -121,7 +102,6 @@ jobs:
           from: ${{ secrets.MAIL_USER }}
           body: ${{ env.MAIL_BODY }}
 
-      # ✅ Skip 的情況不寄失敗信（因為不會是 failure()）
       - name: Email on failure
         if: failure()
         uses: dawidd6/action-send-mail@v3
