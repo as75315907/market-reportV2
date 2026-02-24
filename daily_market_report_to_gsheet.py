@@ -803,10 +803,12 @@ TICKER_HSI  = "^HSI"
 
 def main():
     svc, sheet_id, tab = gsheet_service()
-        # ---- Dedup: skip if already updated today ----
+  
+    # ---- Dedup: skip if already updated today ----
     if should_skip_today_by_l3(svc, sheet_id, tab):
         # 告訴 workflow 這次是 skip（避免寄信）
         Path("skipped.txt").write_text("1", encoding="utf-8")
+        print("[DEDUP] skipped.txt written. Exit 0.")
         return
     tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
 
