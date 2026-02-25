@@ -8,6 +8,10 @@ on:
     - cron: "15 8 * * 1-5"   # 08:15 UTC = 16:15 Asia/Taipei
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -15,14 +19,31 @@ jobs:
       TZ: Asia/Taipei
       DEBUG_HKEX: "0"
 
+      # 你的 GCP 專案（WIF 後建議明確固定）
+      GCP_PROJECT_ID: stellar-fx-488510-b0
+
       GSHEET_ID: ${{ secrets.GSHEET_ID }}
       GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
       GSHEET_SHEET_NAME: ${{ secrets.GSHEET_SHEET_NAME }}
-      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ✅ WIF Auth（免 key）
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/184144369174/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "gh-dispatcher-sa@stellar-fx-488510-b0.iam.gserviceaccount.com"
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set gcloud project
+        run: |
+          gcloud config set project "${GCP_PROJECT_ID}"
+          gcloud auth list
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,7 +66,8 @@ jobs:
             return f"{k}=<SET len={len(v)}>"
           print(info("GSHEET_ID"))
           print(info("GSHEET_TAB"))
-          print(info("GCP_SA_JSON"))
+          print(info("GSHEET_SHEET_NAME"))
+          print(info("GCP_PROJECT_ID"))
           PY
 
       - name: Run report -> Google Sheet
