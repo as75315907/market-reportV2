@@ -1,11 +1,7 @@
 name: Market Report to Google Sheet (Mon-Fri by 17:00 Taipei)
 
 on:
-  # 目標：17:00 前完成更新
-  # 16:00 + 16:15 台北兩次觸發（備援），搭配 Python 的 L3 去重避免重複跑
-  schedule:
-    - cron: "0 8 * * 1-5"    # 08:00 UTC = 16:00 Asia/Taipei
-    - cron: "15 8 * * 1-5"   # 08:15 UTC = 16:15 Asia/Taipei
+  
   workflow_dispatch:
 
 permissions:
