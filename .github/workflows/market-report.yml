@@ -24,7 +24,7 @@ jobs:
 
       GSHEET_ID: ${{ secrets.GSHEET_ID }}
       GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
-      GSHEET_SHEET_NAME: ${{ secrets.GSHEET_SHEET_NAME }}
+      GSHEET_SHEET_NAME: ${{ secrets.GSHEET_SHEET_NAME || 'IR_updated (PC HOME)' }}
 
     steps:
       - name: Checkout
