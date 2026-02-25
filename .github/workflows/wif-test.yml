@@ -1,0 +1,28 @@
+name: WIF Auth Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/184144369174/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "gh-dispatcher-sa@stellar-fx-488510-b0.iam.gserviceaccount.com"
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify
+        run: |
+          gcloud auth list
+          gcloud config set project stellar-fx-488510-b0
+          gcloud projects describe stellar-fx-488510-b0 --format="value(projectNumber)"
