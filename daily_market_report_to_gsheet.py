@@ -55,22 +55,23 @@ def _debug_save(name: str, text: str):
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def gsheet_service():
-    sheet_id = os.getenv("GSHEET_ID", "").strip()
-    tab = os.getenv("GSHEET_TAB", "").strip()
-    sa_json = os.getenv("GCP_SA_JSON", "").strip()
-    if not sheet_id or not tab or not sa_json:
-        raise RuntimeError("缺少 GSHEET_ID / GSHEET_TAB / GCP_SA_JSON（請在 GitHub Secrets/Env 設定）")
+    """
+    Build Google Sheets API service using Application Default Credentials (ADC).
+    Works with GitHub Actions WIF (google-github-actions/auth@v2) without JSON key.
+    """
+    import os
+    import google.auth
+    from googleapiclient.discovery import build
 
-    # GitHub Secrets multiline JSON often comes with escaped newlines; normalize
-    try:
-        info = json.loads(sa_json)
-    except json.JSONDecodeError:
-        info = json.loads(sa_json.replace("\\n", "\n"))
+    sheet_id = os.getenv("GSHEET_ID")
+    tab = os.getenv("GSHEET_TAB")
 
-    if isinstance(info, dict) and "private_key" in info and isinstance(info["private_key"], str):
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    if not sheet_id or not tab:
+        raise RuntimeError("缺少 GSHEET_ID / GSHEET_TAB（請在 GitHub Secrets/Env 設定）")
 
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds, _ = google.auth.default(scopes=scopes)
+
     svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return svc, sheet_id, tab
 
