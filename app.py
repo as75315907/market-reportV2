@@ -1,36 +1,14 @@
 
 import os
-import sys
 import subprocess
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime
+import sys
 from flask import Flask, Response
 
+from market_report.mail import send_mail
+from market_report.status_summary import email_subject_for_result, parse_run_output
+from market_report.time_utils import timestamp_taipei
+
 app = Flask(__name__)
-
-def send_mail(subject: str, body: str):
-    host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "465").strip() or 465)
-    user = os.getenv("SMTP_USER", "").strip()
-    pwd  = os.getenv("SMTP_APP_PASSWORD", "").strip()
-    to   = os.getenv("MAIL_TO", "").strip()
-
-    if not (host and user and pwd and to):
-        print("[MAIL] Missing SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_APP_PASSWORD/MAIL_TO -> skip")
-        return
-
-    to_list = [x.strip() for x in to.split(",") if x.strip()]
-
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = ", ".join(to_list)
-
-    # Gmail 465: SMTP over SSL
-    with smtplib.SMTP_SSL(host, port, timeout=25) as s:
-        s.login(user, pwd)
-        s.sendmail(user, to_list, msg.as_string())
 
 @app.get("/")
 def health():
@@ -61,17 +39,16 @@ def run_job():
         out = f"[TIMEOUT] daily_market_report_to_gsheet.py timeout: {e}\n"
         print(out)
 
-        now_tw = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         subject = "⏱️Daily Market Report 執行逾時（timeout）"
-        body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
+        body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
         send_mail(subject, body)
 
         return Response(out, status=504, mimetype="text/plain")
 
     print(out)
 
-    now_tw = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    skipped = ("[DEDUP] Already updated today" in out) or ("skipped.txt written" in out)
+    summary = parse_run_output(out)
+    skipped = summary.skipped or ("skipped.txt written" in out)
 
     notify_on_skip = os.getenv("MAIL_NOTIFY_ON_SKIP", "0").strip() == "1"
 
@@ -79,13 +56,14 @@ def run_job():
         if skipped and not notify_on_skip:
             return Response(out, status=200, mimetype="text/plain")
 
-        subject = "🟨Daily Market Report（略過：今日已更新）" if skipped else "✅Daily Market Report 更新成功"
-        body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
+        result = "skip" if skipped else "success"
+        subject = email_subject_for_result(result)
+        body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
         send_mail(subject, body)
         return Response(out, status=200, mimetype="text/plain")
 
     # failure
-    subject = "❌Daily Market Report 更新失敗"
-    body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
+    subject = email_subject_for_result("fail")
+    body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
     send_mail(subject, body)
     return Response(out, status=500, mimetype="text/plain")

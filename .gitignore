@@ -3,3 +3,5 @@
 logs/
 debug/
 reports/
+__pycache__/
+*.py[cod]

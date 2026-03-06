@@ -1,19 +1,10 @@
-import json, os, re, sys
-from datetime import datetime
+import json
+import os
+import sys
 from google.cloud import storage
 
-def parse_log(text: str):
-    result = "success"
-    skipped = False
-    last_updated = None
-    m = re.search(r"\[DEDUP\] Already updated today at ([0-9:\-\s]+) -> skip", text)
-    if m:
-        result = "skip"
-        skipped = True
-        last_updated = m.group(1).strip()
-    if "Traceback (most recent call last):" in text and result != "skip":
-        result = "fail"
-    return result, skipped, last_updated
+from market_report.status_summary import parse_run_output
+from market_report.time_utils import timestamp_taipei, today_taipei
 
 def main():
     if len(sys.argv) < 2:
@@ -29,17 +20,16 @@ def main():
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
 
-    result, skipped, last_updated = parse_log(text)
+    summary = parse_run_output(text)
     payload = {
-        "time_taipei": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "result": result,
-        "skipped": skipped,
-        "last_updated_today": last_updated,
+        "time_taipei": timestamp_taipei(),
+        "result": summary.result,
+        "skipped": summary.skipped,
+        "last_updated_today": summary.last_updated,
         "log_tail": text[-4000:],
     }
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    object_name = f"status/{today}.json"
+    object_name = f"status/{today_taipei()}.json"
 
     client = storage.Client()
     client.bucket(bucket).blob(object_name).upload_from_string(
