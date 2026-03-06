@@ -32,6 +32,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from market_report.hk_market import hk_hands_from_aastocks, hk_turnover_scan_prev, hk_turnover_two_days
 from market_report.quote_updates import build_hk_stock_updates, build_tw_stock_updates, fetch_hk_stock_map
 from market_report.revenue import update_revenue_tab
+from market_report.sheet_exports import get_sheet_properties, hide_column_a
 from market_report.sheet_layout import find_stock_rows_from_sheet
 from market_report.tw_market import tw_price_pack_for_codes, twse_turnover_yi
 
@@ -232,6 +233,7 @@ def main():
         print("[DEDUP] skipped.txt written. Exit 0.")
         return
     tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
+    sheet_props = get_sheet_properties(svc, sheet_id, tab)
 
     # Detect "first run" (user cleared D/E/H/I/J/K)
     first_block = get_values(svc, sheet_id, f"{tab_q}!D3:K60")
@@ -359,6 +361,7 @@ def main():
 
 
     batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
+    hide_column_a(svc, sheet_id, sheet_props["sheetId"])
 
     # NEW: update Revenue tab
     update_revenue_tab(
