@@ -124,18 +124,35 @@ def _today_taipei() -> datetime:
     # GitHub Actions default is UTC; if you need strict Asia/Taipei, convert with zoneinfo.
     return datetime.now()
 
-def _parse_l3_datetime(v) -> datetime | None:
-    """解析 L3 內的更新時間字串；支援你常見格式。"""
-    if v is None:
+def _parse_sheet_datetime(date_value, time_value=None) -> datetime | None:
+    """解析 L3/M3 的更新時間；相容舊格式 L3 單格日期時間。"""
+    if date_value is None:
         return None
-    s = str(v).strip()
-    if not s:
+    date_text = str(date_value).strip()
+    time_text = str(time_value).strip() if time_value is not None else ""
+    if not date_text:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            pass
+
+    candidates = []
+    if time_text:
+        candidates.extend(
+            [
+                f"{date_text} {time_text}",
+                f"{date_text} {time_text}:00" if len(time_text) == 5 else f"{date_text} {time_text}",
+            ]
+        )
+    candidates.append(date_text)
+
+    for text in candidates:
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                pass
     return None
 
 def should_skip_today_by_l3(svc, sheet_id: str, tab_name: str) -> bool:
@@ -148,11 +165,14 @@ def should_skip_today_by_l3(svc, sheet_id: str, tab_name: str) -> bool:
         return False
 
     tab_q = f"'{tab_name}'" if re.search(r"[^A-Za-z0-9_]", tab_name) else tab_name
-    v = get_values(svc, sheet_id, f"{tab_q}!L3:L3")
-    last_dt = _parse_l3_datetime(v[0][0]) if (v and v[0]) else None
+    values = get_values(svc, sheet_id, f"{tab_q}!L3:M3")
+    row = values[0] if values else []
+    l3_value = row[0] if len(row) > 0 else None
+    m3_value = row[1] if len(row) > 1 else None
+    last_dt = _parse_sheet_datetime(l3_value, m3_value)
 
     if last_dt is None:
-        print("[DEDUP] L3 empty/unparseable -> do not skip")
+        print("[DEDUP] L3/M3 empty or unparseable -> do not skip")
         return False
 
     today = datetime.now().date()  # 你 workflow 已設 TZ=Asia/Taipei
@@ -304,7 +324,8 @@ def main():
     # build updates
     updates = []
     now = _today_taipei()
-    updates.append((f"{tab_q}!L3", [[now.strftime("%Y-%m-%d %H:%M:%S")]]))
+    updates.append((f"{tab_q}!L3", [[now.strftime("%Y-%m-%d")]]))
+    updates.append((f"{tab_q}!M3", [[now.strftime("%H:%M:%S")]]))
 
     updates.append((f"{tab_q}!D6", [[_round2(twii.get("close"))]]))
     updates.append((f"{tab_q}!E6", [[_round2(twii.get("prev_close"))]]))
