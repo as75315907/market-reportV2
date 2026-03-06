@@ -9,4 +9,3 @@ Current entrypoints:
 Project structure:
 - `market_report/`: shared modules extracted from the original monolithic script.
 - `tests/`: regression tests for shared logic and parsing helpers.
-- `legacy/`: historical script variants kept for reference during refactoring. They are not used by current deployment paths.
