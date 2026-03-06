@@ -1,4 +1,6 @@
+
 import os
+import sys
 import subprocess
 import smtplib
 from email.mime.text import MIMEText
@@ -36,14 +38,36 @@ def health():
 
 @app.post("/run")
 def run_job():
-    p = subprocess.run(
-        ["python", "daily_market_report_to_gsheet.py"],
-        capture_output=True,
-        text=True,
-        env=os.environ.copy(),
-    )
+    env = os.environ.copy()
 
-    out = (p.stdout or "") + "\n" + (p.stderr or "")
+    # （可選但建議）快速確認 Scheduler/Cloud Run 實際有讀到哪些 env
+    # 只印前幾碼避免把敏感資訊完整打到 log
+    def _mask(v: str, n: int = 6) -> str:
+        v = (v or "").strip()
+        return (v[:n] + "..." if len(v) > n else v) if v else "(empty)"
+
+    print(f"[ENV] GSHEET_ID={_mask(env.get('GSHEET_ID'))} | GSHEET_TAB={_mask(env.get('GSHEET_TAB'))} | GSHEET_SHEET_NAME={_mask(env.get('GSHEET_SHEET_NAME'))}")
+
+    try:
+        p = subprocess.run(
+            [sys.executable, "daily_market_report_to_gsheet.py"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=850,  # < 900s：留緩衝，避免 Scheduler/Run 的 deadline 先到
+        )
+        out = (p.stdout or "") + "\n" + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        out = f"[TIMEOUT] daily_market_report_to_gsheet.py timeout: {e}\n"
+        print(out)
+
+        now_tw = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        subject = "⏱️Daily Market Report 執行逾時（timeout）"
+        body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
+        send_mail(subject, body)
+
+        return Response(out, status=504, mimetype="text/plain")
+
     print(out)
 
     now_tw = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -55,13 +79,13 @@ def run_job():
         if skipped and not notify_on_skip:
             return Response(out, status=200, mimetype="text/plain")
 
-        subject = "🟨 Daily Market Report（略過：今日已更新）" if skipped else "✅ Daily Market Report 更新成功"
+        subject = "🟨Daily Market Report（略過：今日已更新）" if skipped else "✅Daily Market Report 更新成功"
         body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
         send_mail(subject, body)
         return Response(out, status=200, mimetype="text/plain")
 
     # failure
-    subject = "❌ Daily Market Report 更新失敗"
+    subject = "❌Daily Market Report 更新失敗"
     body = f"Time(Taipei): {now_tw}\n\n" + out[-4000:]
     send_mail(subject, body)
     return Response(out, status=500, mimetype="text/plain")

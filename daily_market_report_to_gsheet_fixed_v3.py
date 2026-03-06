@@ -955,7 +955,7 @@ def main():
 
     # HK stocks via yfinance
     hk_codes = [code for _, code in hk_rows]
-    hk_tickers = [f"{int(c):04d}.HK" for c in hk_codes]
+    hk_tickers = [f"{int(c):05d}.HK" for c in hk_codes]
     hk_stock_map = {}
     for tkr in hk_tickers:
         try:

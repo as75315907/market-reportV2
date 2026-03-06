@@ -21,6 +21,7 @@ import json
 import math
 import time
 import re
+from bs4 import BeautifulSoup
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -524,6 +525,93 @@ def hk_hands_from_aastocks(code: str, timeout: int = 20):
 
     url = f"https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol={code}"
 
+    html = ""
+    # 1) try requests first
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                "Referer": "https://www.aastocks.com/tc/stocks/",
+            },
+        )
+        if resp.status_code == 200:
+            html = resp.text or ""
+    except Exception:
+        html = ""
+
+    # 2) fallback to curl if blocked / empty / looks like bot page
+    if (not html) or ("Access Denied" in html) or ("請啟用JavaScript" in html) or (len(html) < 3000):
+        try:
+            html = _curl_get_text(
+                url,
+                timeout=timeout,
+                http1=True,
+                extra_headers=[
+                    "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8",
+                    "Referer: https://www.aastocks.com/tc/stocks/",
+                ],
+            )
+        except Exception:
+            return None
+
+    if not html:
+        return None
+
+    # 3) parse: prefer exact "成交量(手)" to avoid picking share volume
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        page_text = soup.get_text(" ", strip=True)
+
+        for pat in [
+            r"成交量\s*\(\s*手\s*\)\s*([0-9,]+)",
+            r"成交量（手）\s*([0-9,]+)",
+            r"成交量\s*[:：]?\s*([0-9,]+)\s*手",
+        ]:
+            m = re.search(pat, page_text)
+            if m:
+                return int(m.group(1).replace(",", ""))
+
+        label_node = soup.find(string=re.compile(r"成交量\s*[\(（]\s*手\s*[\)）]"))
+        if label_node is not None:
+            cell = label_node.parent
+            while cell is not None and getattr(cell, "name", None) not in ("td", "th"):
+                cell = cell.parent
+            if cell is not None:
+                nxt = cell.find_next("td")
+                if nxt is not None:
+                    txt = nxt.get_text(" ", strip=True)
+                    m = re.search(r"([0-9,]+)", txt)
+                    if m:
+                        return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+
+    for pat in [
+        r"成交量\s*[\(（]\s*手\s*[\)）][^0-9]{0,80}([0-9,]+)",
+        r"成交量（手）[^0-9]{0,80}([0-9,]+)",
+    ]:
+        m = re.search(pat, html)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except Exception:
+                return None
+
+    return None
+
+
+    # normalize: digits only, 4~5 digits, keep leading zeros
+    code = re.sub(r"\D", "", code)
+    if len(code) == 4:
+        code = code.zfill(5)
+    if len(code) != 5:
+        return None
+
+    url = f"https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol={code}"
+
     try:
         resp = requests.get(url, timeout=timeout, headers={"User-Agent": UA})
         if resp.status_code != 200:
@@ -955,7 +1043,7 @@ def main():
 
     # HK stocks via yfinance
     hk_codes = [code for _, code in hk_rows]
-    hk_tickers = [f"{int(c):04d}.HK" for c in hk_codes]
+    hk_tickers = [f"{int(c):05d}.HK" for c in hk_codes]
     hk_stock_map = {}
     for tkr in hk_tickers:
         try:
@@ -1035,7 +1123,9 @@ def main():
         # 港股成交量：僅針對 03368 / 00825 兩檔改成「AASTOCKS 優先、失敗才用 lot size 換算」
         # 其餘港股維持原本邏輯（避免影響其他欄位/股票）
         if code in ("03368", "00825"):
+    _dbg_hk = str(os.environ.get("DEBUG_HKEX", "0")).strip() == "1"
             hands = hk_hands_from_aastocks(code)
+    if _dbg_hk: print(f"[HK HANDS] {code} AASTOCKS hands = {hands}")
             if hands is None:
                 # fallback：用 yfinance 的成交量(股) / 每手股數 -> 手數
                 lot_size_map = {"03368": 500, "00825": 1000}
@@ -1054,6 +1144,7 @@ def main():
                     hands = int(round(float(vol) / 1000.0)) if vol is not None else None
                 except Exception:
                     hands = None
+    if _dbg_hk: print(f"[HK HANDS] {code} final hands = {hands}")
 
         updates.append((f"{tab_q}!D{r}", [[close]]))
         updates.append((f"{tab_q}!E{r}", [[prev]]))

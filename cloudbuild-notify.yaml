@@ -1,0 +1,5 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build','-t','asia-east1-docker.pkg.dev/stellar-fx-488510-b0/market-report-repo/market-report-notify:latest','-f','Dockerfile.notify','.']
+images:
+- 'asia-east1-docker.pkg.dev/stellar-fx-488510-b0/market-report-repo/market-report-notify:latest'

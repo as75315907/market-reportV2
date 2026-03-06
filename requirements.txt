@@ -11,3 +11,6 @@ google-api-python-client==2.160.0
 google-auth==2.37.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib
+gunicorn
+Flask
+google-cloud-storage

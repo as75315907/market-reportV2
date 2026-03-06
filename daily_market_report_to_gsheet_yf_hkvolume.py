@@ -21,6 +21,7 @@ import json
 import math
 import time
 import re
+from bs4 import BeautifulSoup
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -416,6 +417,213 @@ def tw_price_pack_for_codes(codes: list[str], t_date: datetime, p_date: datetime
 # ========= HK turnover =========
 HKEX_DAYQUOT = "https://www.hkex.com.hk/eng/stat/smstat/dayquot/d{yymmdd}e.htm"
 HKEX_DAYQUOT_REFERER = "https://www.hkex.com.hk/eng/stat/smstat/dayquot/qtn.asp"
+
+# --- HKEX equity quote (per-stock) volume fallback (used ONLY for 03368 / 00825) ---
+
+HKEX_EQUITY_QUOTE_PAGE = "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sc_lang=en&sym={sym}"
+HKEX_WIDGET_EQUITYQUOTE = "https://www1.hkex.com.hk/hkexwidget/data/getequityquote?sym={sym}&token={token}&lang=eng&qid={qid}&callback={cb}"
+
+def _hkex_debug_on() -> bool:
+    return str(os.environ.get("DEBUG_HKEX", "0")).strip() == "1"
+
+def _strip_jsonp(s: str) -> str:
+    # callback({...});  -> {...}
+    s = (s or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"\(\s*(\{.*\})\s*\)\s*;?\s*$", s, flags=re.S)
+    return m.group(1) if m else s
+
+def _to_int_maybe(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        try:
+            return int(x)
+        except Exception:
+            return None
+    s = str(x).strip()
+    if not s:
+        return None
+    # remove commas and non-digits except minus
+    s2 = re.sub(r"[^\d\-]", "", s.replace(",", ""))
+    if not s2 or s2 == "-":
+        return None
+    try:
+        return int(s2)
+    except Exception:
+        return None
+
+def _find_volume_shares_in_json(obj):
+    """
+    Try to locate per-stock traded volume (shares) in HKEX widget JSON.
+    HKEX may change field names; we search common candidates and fall back to heuristic scan.
+    """
+    # common direct paths
+    if isinstance(obj, dict):
+        # Typical response: {"data":{"quote":{"trdVol":"123,456", ...}}}
+        for path in [
+            ("data", "quote", "trdVol"),
+            ("data", "quote", "volume"),
+            ("data", "quote", "trdvol"),
+            ("data", "quote", "trdVolShares"),
+            ("data", "quote", "trdVol", "value"),
+        ]:
+            cur = obj
+            ok = True
+            for k in path:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok:
+                v = _to_int_maybe(cur)
+                if v is not None and v >= 0:
+                    return v
+
+        # Heuristic: scan keys that look like traded volume
+        best = None
+        def rec(o):
+            nonlocal best
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    lk = str(k).lower()
+                    if "vol" in lk and "turn" not in lk and "value" not in lk:
+                        iv = _to_int_maybe(v)
+                        if iv is not None and iv >= 0:
+                            # prefer bigger (shares often big)
+                            if best is None or iv > best:
+                                best = iv
+                    rec(v)
+            elif isinstance(o, list):
+                for it in o:
+                    rec(it)
+        rec(obj)
+        return best
+    elif isinstance(obj, list):
+        for it in obj:
+            v = _find_volume_shares_in_json(it)
+            if v is not None:
+                return v
+    return None
+
+def hkex_get_widget_token(sym: str, timeout: int = 20):
+    """
+    Get HKEX widget token from the equities quote page HTML.
+    sym: numeric string without leading zeros (e.g., '3368', '825')
+    """
+    url = HKEX_EQUITY_QUOTE_PAGE.format(sym=sym)
+    html = ""
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8"})
+        if r.status_code == 200:
+            html = r.text or ""
+        if _hkex_debug_on():
+            print(f"[HKEX TOKEN] sym={sym} status={getattr(r,'status_code',None)} len={len(html)}")
+    except Exception as e:
+        if _hkex_debug_on():
+            print(f"[HKEX TOKEN] sym={sym} requests error: {e}")
+        html = ""
+
+    if (not html) or (len(html) < 2000):
+        try:
+            html = _curl_get_text(url, timeout=timeout, http1=True, extra_headers=[
+                "Accept-Language: en-US,en;q=0.9,zh-TW;q=0.8",
+                f"User-Agent: {UA}",
+            ])
+            if _hkex_debug_on():
+                print(f"[HKEX TOKEN] sym={sym} curl len={len(html)}")
+        except Exception as e:
+            if _hkex_debug_on():
+                print(f"[HKEX TOKEN] sym={sym} curl error: {e}")
+            return None
+
+    # Token appears in JS as token:"XXXX" or token: "XXXX" or "token":"XXXX"
+    for pat in [
+        r'token"\s*:\s*"([^"]+)"',
+        r'\btoken\s*:\s*"([^"]+)"',
+        r'\btoken\s*=\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+
+    # Some pages embed token in hkexwidget config; try a looser pattern
+    m = re.search(r'["\']token["\']\s*[,:\s]+\s*["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+
+    if _hkex_debug_on():
+        snippet = re.sub(r"\s+", " ", html[:500])
+        print(f"[HKEX TOKEN] sym={sym} token not found; snippet={snippet!r}")
+    return None
+
+def hkex_get_equityquote_json(sym: str, timeout: int = 20):
+    """
+    Call HKEX hkexwidget equity quote endpoint and return parsed JSON (dict), or None.
+    """
+    token = hkex_get_widget_token(sym, timeout=timeout)
+    if not token:
+        return None
+
+    # qid/callback can be arbitrary; HKEX typically ignores them for data content
+    qid = str(int(__import__("time").time() * 1000))
+    cb = "callback"
+    url = HKEX_WIDGET_EQUITYQUOTE.format(sym=sym, token=token, qid=qid, cb=cb)
+
+    txt = ""
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": UA, "Referer": HKEX_EQUITY_QUOTE_PAGE.format(sym=sym)})
+        if r.status_code == 200:
+            txt = r.text or ""
+        if _hkex_debug_on():
+            print(f"[HKEX WIDGET] sym={sym} status={getattr(r,'status_code',None)} len={len(txt)}")
+    except Exception as e:
+        if _hkex_debug_on():
+            print(f"[HKEX WIDGET] sym={sym} requests error: {e}")
+        txt = ""
+
+    if (not txt) or (len(txt) < 50):
+        try:
+            txt = _curl_get_text(url, timeout=timeout, http1=True, extra_headers=[
+                f"Referer: {HKEX_EQUITY_QUOTE_PAGE.format(sym=sym)}",
+                "Accept-Language: en-US,en;q=0.9,zh-TW;q=0.8",
+            ])
+            if _hkex_debug_on():
+                print(f"[HKEX WIDGET] sym={sym} curl len={len(txt)}")
+        except Exception as e:
+            if _hkex_debug_on():
+                print(f"[HKEX WIDGET] sym={sym} curl error: {e}")
+            return None
+
+    payload = _strip_jsonp(txt)
+    try:
+        return json.loads(payload)
+    except Exception as e:
+        if _hkex_debug_on():
+            snippet = re.sub(r"\s+", " ", payload[:500])
+            print(f"[HKEX WIDGET] sym={sym} json parse error: {e}; snippet={snippet!r}")
+        return None
+
+def hkex_get_volume_shares(sym5: str, timeout: int = 20):
+    """
+    Get traded volume in shares from HKEX widget for a given 5-digit code (e.g., '03368').
+    Returns int (shares) or None.
+    """
+    sym5 = re.sub(r"\D", "", (sym5 or "").strip())
+    if not sym5:
+        return None
+    # HKEX quote page uses numeric without leading zeros
+    sym = str(int(sym5))
+    j = hkex_get_equityquote_json(sym, timeout=timeout)
+    if not j:
+        return None
+    vol = _find_volume_shares_in_json(j)
+    if _hkex_debug_on():
+        print(f"[HKEX VOL] sym={sym5} vol_shares={vol}")
+    return vol
+
 AASTOCKS_HSI_URL = "https://www.aastocks.com/tc/stocks/market/index/hk-index-con.aspx?index=HSI&o=0&p=&s=8&t=6"
 
 def _curl_get_text(url: str, timeout: int = 30, insecure: bool = False, http1: bool = False, extra_headers=None) -> str:
@@ -514,6 +722,93 @@ def hk_hands_from_aastocks(code: str, timeout: int = 20):
     code = (code or "").strip()
     if not code:
         return None
+
+    # normalize: digits only, 4~5 digits, keep leading zeros
+    code = re.sub(r"\D", "", code)
+    if len(code) == 4:
+        code = code.zfill(5)
+    if len(code) != 5:
+        return None
+
+    url = f"https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol={code}"
+
+    html = ""
+    # 1) try requests first
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": UA,
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                "Referer": "https://www.aastocks.com/tc/stocks/",
+            },
+        )
+        if resp.status_code == 200:
+            html = resp.text or ""
+    except Exception:
+        html = ""
+
+    # 2) fallback to curl if blocked / empty / looks like bot page
+    if (not html) or ("Access Denied" in html) or ("請啟用JavaScript" in html) or (len(html) < 3000):
+        try:
+            html = _curl_get_text(
+                url,
+                timeout=timeout,
+                http1=True,
+                extra_headers=[
+                    "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8",
+                    "Referer: https://www.aastocks.com/tc/stocks/",
+                ],
+            )
+        except Exception:
+            return None
+
+    if not html:
+        return None
+
+    # 3) parse: prefer exact "成交量(手)" to avoid picking share volume
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        page_text = soup.get_text(" ", strip=True)
+
+        for pat in [
+            r"成交量\s*\(\s*手\s*\)\s*([0-9,]+)",
+            r"成交量（手）\s*([0-9,]+)",
+            r"成交量\s*[:：]?\s*([0-9,]+)\s*手",
+        ]:
+            m = re.search(pat, page_text)
+            if m:
+                return int(m.group(1).replace(",", ""))
+
+        label_node = soup.find(string=re.compile(r"成交量\s*[\(（]\s*手\s*[\)）]"))
+        if label_node is not None:
+            cell = label_node.parent
+            while cell is not None and getattr(cell, "name", None) not in ("td", "th"):
+                cell = cell.parent
+            if cell is not None:
+                nxt = cell.find_next("td")
+                if nxt is not None:
+                    txt = nxt.get_text(" ", strip=True)
+                    m = re.search(r"([0-9,]+)", txt)
+                    if m:
+                        return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+
+    for pat in [
+        r"成交量\s*[\(（]\s*手\s*[\)）][^0-9]{0,80}([0-9,]+)",
+        r"成交量（手）[^0-9]{0,80}([0-9,]+)",
+    ]:
+        m = re.search(pat, html)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except Exception:
+                return None
+
+    return None
+
 
     # normalize: digits only, 4~5 digits, keep leading zeros
     code = re.sub(r"\D", "", code)
@@ -955,7 +1250,7 @@ def main():
 
     # HK stocks via yfinance
     hk_codes = [code for _, code in hk_rows]
-    hk_tickers = [f"{int(c):04d}.HK" for c in hk_codes]
+    hk_tickers = [f"{int(c):05d}.HK" for c in hk_codes]
     hk_stock_map = {}
     for tkr in hk_tickers:
         try:
@@ -1032,28 +1327,19 @@ def main():
         low   = _round3(d.get("low"))
         high  = _round3(d.get("high"))
 
-        # 港股成交量：僅針對 03368 / 00825 兩檔改成「AASTOCKS 優先、失敗才用 lot size 換算」
-        # 其餘港股維持原本邏輯（避免影響其他欄位/股票）
+        # 港股成交量(手)：僅針對 03368 / 00825 兩檔，改用 yfinance 的 Volume(股) ÷ lot size 換算
+        # 其餘港股維持既有行為（不主動填 K 欄，避免影響其他港股邏輯）
+        hands = None
         if code in ("03368", "00825"):
-            hands = hk_hands_from_aastocks(code)
-            if hands is None:
-                # fallback：用 yfinance 的成交量(股) / 每手股數 -> 手數
-                lot_size_map = {"03368": 500, "00825": 1000}
-                vol = d.get("volume")
-                try:
-                    lot = lot_size_map.get(code)
-                    hands = int(float(vol) // lot) if (vol is not None and lot) else None
-                except Exception:
-                    hands = None
-        else:
-            # 原本 fallback：若抓不到，再退回用 yfinance volume / 1000 推估
-            hands = hk_hands_from_aastocks(code)
-            if hands is None:
-                vol = d.get("volume")
-                try:
-                    hands = int(round(float(vol) / 1000.0)) if vol is not None else None
-                except Exception:
-                    hands = None
+            lot_size_map = {"03368": 500, "00825": 1000}
+            vol = d.get("volume")  # yfinance Volume (shares)
+            lot = lot_size_map.get(code)
+            try:
+                hands = int(float(vol) // lot) if (vol is not None and lot) else None
+            except Exception:
+                hands = None
+            if str(os.environ.get("DEBUG_HKEX", "0")).strip() == "1":
+                print(f"[HK HANDS] {code} yfinance vol_shares={vol} lot={lot} -> hands={hands}")
 
         updates.append((f"{tab_q}!D{r}", [[close]]))
         updates.append((f"{tab_q}!E{r}", [[prev]]))
@@ -1061,6 +1347,7 @@ def main():
         updates.append((f"{tab_q}!I{r}", [[low]]))
         updates.append((f"{tab_q}!J{r}", [[high]]))
         updates.append((f"{tab_q}!K{r}", [[hands]]))
+
 
 
     batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
