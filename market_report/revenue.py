@@ -10,6 +10,72 @@ REV_TAB_DEFAULT = "營收"
 MOPSFIN_LISTED_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap05_L.csv"
 MOPSFIN_OTC_CSV = "https://mopsfin.twse.com.tw/opendata/t187ap05_O.csv"
 TPEX_EMERGING_JSON = "https://www.tpex.org.tw/openapi/v1/t187ap05_R"
+MOPS_COMPANY_REVENUE_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st10_ifrs"
+MOPS_COMPANY_REVENUE_REFERER = "https://mopsov.twse.com.tw/mops/web/t05st10_ifrs"
+
+
+def fetch_company_month_revenue_mops(session, user_agent: str, code: str, year_ad: int, month: int, to_float):
+    """Fetch one company's monthly revenue from MOPS company query page.
+
+    Returns dict with keys: this, last_year (both in仟元) or None when unavailable.
+    """
+    roc_year = year_ad - 1911
+    payload = {
+        "firstin": "1",
+        "off": "1",
+        "step": "1",
+        "TYPEK": "all",
+        "isnew": "false",
+        "queryName": "co_id",
+        "inpuType": "co_id",
+        "co_id": str(code).zfill(4),
+        "year": str(roc_year),
+        "month": f"{int(month):02d}",
+    }
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": MOPS_COMPANY_REVENUE_REFERER,
+    }
+    response = session.post(MOPS_COMPANY_REVENUE_URL, data=payload, headers=headers, timeout=40)
+    response.raise_for_status()
+    html = response.text or ""
+    # MOPS anti-bot/invalid params response
+    if "頁面無法執行" in html or "年度及月份 欄位錯誤" in html:
+        return None
+
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        return None
+
+    detail = None
+    for t in tables:
+        cols = [str(c) for c in t.columns]
+        if any("營業收入" in c for c in cols):
+            detail = t
+            break
+    if detail is None or detail.empty:
+        return None
+
+    item_col = str(detail.columns[0])
+    value_col = str(detail.columns[1]) if len(detail.columns) > 1 else None
+    if not value_col:
+        return None
+
+    this_val = None
+    last_year_val = None
+    for _, row in detail.iterrows():
+        key = str(row.get(item_col, "")).strip()
+        val = to_float(row.get(value_col))
+        if key == "本月":
+            this_val = val
+        elif key == "去年同期":
+            last_year_val = val
+
+    if this_val is None and last_year_val is None:
+        return None
+
+    return {"this": this_val, "last_year": last_year_val}
 
 
 def ym_add(year: int, month: int, delta_months: int) -> tuple[int, int]:
@@ -167,6 +233,32 @@ def update_revenue_tab(
     now = today_taipei()
     exp_y, exp_m = ym_add(now.year, now.month, -1)
     dataset_ym, rev_map = fetch_monthly_revenue_maps_all(session, user_agent, to_float)
+
+    # Fallback: if open data not updated to expected month yet, query MOPS company page per code.
+    # This is slower but helps bridge the release lag for the tracked code list.
+    enable_fallback = os.getenv("REVENUE_ENABLE_MOPS_FALLBACK", "1").strip() == "1"
+    expected_ym = (exp_y, exp_m)
+    if enable_fallback and rows and (dataset_ym is None or dataset_ym < expected_ym):
+        previous_month_map = {code: (rev_map.get(code, {}) or {}).get("this") for _, code in rows}
+        fetched = 0
+        for _, code in rows:
+            try:
+                mops = fetch_company_month_revenue_mops(session, user_agent, code, exp_y, exp_m, to_float)
+            except Exception:
+                mops = None
+            if not mops:
+                continue
+            rev_map.setdefault(code, {})
+            rev_map[code]["this"] = mops.get("this")
+            rev_map[code]["last_year"] = mops.get("last_year")
+            # MOPS company page doesn't provide previous month directly; use open-data "this" as proxy.
+            if previous_month_map.get(code) is not None:
+                rev_map[code]["last_month"] = previous_month_map.get(code)
+            fetched += 1
+
+        if fetched > 0:
+            dataset_ym = expected_ym
+            print(f"Revenue fallback used: MOPS company query | month={exp_y}-{exp_m:02d} | fetched={fetched}")
 
     use_y, use_m = dataset_ym if dataset_ym else (exp_y, exp_m)
     y_ly, m_ly = use_y - 1, use_m
