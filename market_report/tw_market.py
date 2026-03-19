@@ -231,6 +231,11 @@ def tw_price_pack_for_codes(
     to_float,
 ) -> tuple[dict, dict]:
     today_map, prev_map = {}, {}
+    # 需要用上櫃嚴格規則的代號（避免在官方缺值時被 yfinance 錯日覆蓋）
+    # 依目前清單先固定：2926, 5903, 5904, 1259, 2729, 8044, 8477, 6741
+    tpex_strict_codes = {"2926", "5903", "5904", "1259", "2729", "8044", "8477", "6741"}
+    # 自動偵測為上櫃來源的代號，會優先 TWO 後綴
+    tpex_detected_codes: set[str] = set()
 
     try:
         today_map = parse_mi_index_map(fetch_mi_index(session, t_date), to_float=to_float)
@@ -252,6 +257,8 @@ def tw_price_pack_for_codes(
     openapi_prev_map = parse_tpex_openapi_map(openapi_rows, p_date, to_float=to_float)
 
     for code in codes:
+        if code in openapi_today_map or code in openapi_prev_map:
+            tpex_detected_codes.add(code)
         if code not in today_map and code in openapi_today_map:
             today_map[code] = openapi_today_map[code]
         if code not in prev_map and code in openapi_prev_map:
@@ -262,6 +269,7 @@ def tw_price_pack_for_codes(
             try:
                 parsed = parse_tpex_st43(fetch_tpex_st43(session, code, t_date) or {}, to_float=to_float)
                 if parsed:
+                    tpex_detected_codes.add(code)
                     today_map[code] = parsed
             except Exception:
                 pass
@@ -269,6 +277,7 @@ def tw_price_pack_for_codes(
             try:
                 parsed = parse_tpex_st43(fetch_tpex_st43(session, code, p_date) or {}, to_float=to_float)
                 if parsed:
+                    tpex_detected_codes.add(code)
                     prev_map[code] = parsed
             except Exception:
                 pass
@@ -277,12 +286,14 @@ def tw_price_pack_for_codes(
         if code in today_map and code in prev_map:
             continue
 
-        # 需求特例：2926（誠品生活）若交易所當日資料缺失，不用 yfinance 補當日，
-        # 避免把錯日成交帶入（例如應為無成交卻抓到其他日期成交）。
-        if code == "2926" and code not in today_map:
+        # 指定/偵測為上櫃的股票，若交易所當日資料缺失，不用 yfinance 補當日，
+        # 避免帶入錯日行情。
+        is_tpex_style = code in tpex_strict_codes or code in tpex_detected_codes
+        if is_tpex_style and code not in today_map:
             continue
 
-        for suffix in ("TW", "TWO"):
+        suffix_order = ("TWO", "TW") if is_tpex_style else ("TW", "TWO")
+        for suffix in suffix_order:
             ticker = f"{code}.{suffix}"
             try:
                 history = hist_one(ticker)
@@ -337,14 +348,50 @@ def tw_price_pack_for_codes(
             except Exception:
                 continue
 
-    # 需求特例：2926（誠品生活）若今日缺官方資料，強制視為無成交日
+    tpex_guard_codes = (tpex_strict_codes | tpex_detected_codes) & set(codes)
+
+    # 上櫃防呆：若前日收盤缺值，補抓 yfinance 對齊 p_date 的收盤（只補 prev，不補 today）
+    for code in tpex_guard_codes:
+        p_obj = prev_map.get(code)
+        p_close = p_obj.get("close") if isinstance(p_obj, dict) else None
+        if p_close is not None:
+            continue
+        for suffix in ("TW", "TWO"):
+            ticker = f"{code}.{suffix}"
+            try:
+                history = hist_one(ticker)
+                if history is None or history.empty or "Close" not in history.columns:
+                    continue
+                h = history.copy()
+                idx = h.index
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_localize(None)
+                h.index = pd.to_datetime(idx).normalize()
+                p_key = pd.Timestamp(p_date.date())
+                p_row = h.loc[h.index == p_key]
+                if p_row.empty:
+                    older = h.loc[h.index <= p_key]
+                    if older.empty:
+                        continue
+                    pr = older.iloc[-1]
+                else:
+                    pr = p_row.iloc[-1]
+                if pd.notna(pr.get("Close")):
+                    prev_map[code] = {"close": float(pr.get("Close"))}
+                    break
+            except Exception:
+                continue
+
+    # 上櫃股若今日缺官方資料，強制視為無成交日
     # -> 開高低=0、成交量=0、今日收盤=前日收盤（若有）
-    if "2926" in codes and "2926" not in today_map:
+    for code in tpex_guard_codes:
+        if code in today_map:
+            continue
         p_close = None
-        p_obj = prev_map.get("2926")
+        p_obj = prev_map.get(code)
         if isinstance(p_obj, dict):
             p_close = p_obj.get("close")
-        today_map["2926"] = {
+        today_map[code] = {
             "open": 0.0,
             "high": 0.0,
             "low": 0.0,
