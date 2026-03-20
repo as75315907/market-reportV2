@@ -125,6 +125,30 @@ def _today_taipei() -> datetime:
     # GitHub Actions default is UTC; if you need strict Asia/Taipei, convert with zoneinfo.
     return datetime.now()
 
+
+def _resolve_tw_trade_dates(session, fallback_today: datetime) -> tuple[datetime, datetime]:
+    """
+    Resolve TW market today/prev trade dates from TWSE turnover endpoint instead of ^TWII yfinance.
+    This avoids missing-day issues when index data has gaps and accidentally skips a trade date.
+    """
+    # scan backward and collect first 2 dates with valid TWSE turnover
+    found: list[datetime] = []
+    base = fallback_today
+    for back in range(0, 14):
+        dt = base - timedelta(days=back)
+        yi = twse_turnover_yi(session, dt)
+        if yi is None:
+            continue
+        found.append(dt)
+        if len(found) >= 2:
+            break
+
+    if len(found) >= 2:
+        return found[0], found[1]
+
+    # fallback to original behavior if endpoint is unavailable
+    return fallback_today, fallback_today - timedelta(days=1)
+
 def _parse_sheet_datetime(date_value, time_value=None) -> datetime | None:
     """解析 L3/M3 的更新時間；相容舊格式 L3 單格日期時間。"""
     if date_value is None:
@@ -267,14 +291,9 @@ def main():
     twii = idx_map.get(TICKER_TWII, {})
     hsi  = idx_map.get(TICKER_HSI, {})
 
-    tw_t = twii.get("t_date")
-    tw_p = twii.get("p_date")
-    if not isinstance(tw_t, pd.Timestamp) or not isinstance(tw_p, pd.Timestamp):
-        now = _today_taipei()
-        tw_t = pd.Timestamp(now.date())
-        tw_p = pd.Timestamp((now - timedelta(days=1)).date())
-    tw_t_dt = tw_t.to_pydatetime()
-    tw_p_dt = tw_p.to_pydatetime()
+    # TW trade dates: use TWSE official turnover availability first (more stable than ^TWII yfinance)
+    now = _today_taipei()
+    tw_t_dt, tw_p_dt = _resolve_tw_trade_dates(_SESSION, now)
 
     # turnovers
     tw_today_yi = twse_turnover_yi(_SESSION, tw_t_dt)
