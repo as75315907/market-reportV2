@@ -283,6 +283,9 @@ def update_revenue_tab(
             # Current month is unavailable -> mark C as N/A.
             # Keep D/F untouched to preserve previously known values.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            # Avoid formula errors on YoY%/MoM% when C is non-numeric.
+            updates.append((f"{tab_q}!E{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!G{row_no}", [["N/A"]]))
             continue
 
         code_ym = data.get("ym")
@@ -291,6 +294,9 @@ def update_revenue_tab(
             # This code is not updated to header month yet.
             # Only mark current month as N/A; keep YoY-base / MoM-base columns intact.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            # Avoid formula errors on YoY%/MoM% when C is non-numeric.
+            updates.append((f"{tab_q}!E{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!G{row_no}", [["N/A"]]))
             continue
 
         updates.append((f"{tab_q}!C{row_no}", [[data.get("this")]]))
