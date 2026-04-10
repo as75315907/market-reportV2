@@ -203,10 +203,12 @@ def fetch_monthly_revenue_maps_all(session, user_agent: str, to_float) -> tuple[
         code = re.sub(r"\D", "", code)
         if not code:
             continue
+        row_ym = parse_ym_any(row.get(ym_col)) if ym_col else None
         revenue_map[code] = {
             "this": to_float(row.get(this_col)),
             "last_year": to_float(row.get(lasty_col)),
             "last_month": to_float(row.get(lastm_col)),
+            "ym": row_ym,
         }
 
     return dataset_ym, revenue_map
@@ -251,6 +253,7 @@ def update_revenue_tab(
             rev_map.setdefault(code, {})
             rev_map[code]["this"] = mops.get("this")
             rev_map[code]["last_year"] = mops.get("last_year")
+            rev_map[code]["ym"] = expected_ym
             # MOPS company page doesn't provide previous month directly; use open-data "this" as proxy.
             if previous_month_map.get(code) is not None:
                 rev_map[code]["last_month"] = previous_month_map.get(code)
@@ -271,13 +274,23 @@ def update_revenue_tab(
     ]
 
     missing: list[str] = []
+    stale: list[str] = []
     for row_no, code in rows:
         data = rev_map.get(code)
+        # Only write when this code truly has the same month as header month.
         if not data:
             missing.append(code)
-            updates.append((f"{tab_q}!C{row_no}", [[None]]))
-            updates.append((f"{tab_q}!D{row_no}", [[None]]))
-            updates.append((f"{tab_q}!F{row_no}", [[None]]))
+            updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!D{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!F{row_no}", [["N/A"]]))
+            continue
+
+        code_ym = data.get("ym")
+        if code_ym != (use_y, use_m):
+            stale.append(code)
+            updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!D{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!F{row_no}", [["N/A"]]))
             continue
 
         updates.append((f"{tab_q}!C{row_no}", [[data.get("this")]]))
@@ -290,3 +303,5 @@ def update_revenue_tab(
     print(f"Revenue tab updated: {tab} | month={use_y}-{use_m:02d} | rows={len(rows)}")
     if missing:
         print("Revenue missing codes:", ", ".join(missing))
+    if stale:
+        print(f"Revenue stale codes (not {use_y}-{use_m:02d}):", ", ".join(stale))
