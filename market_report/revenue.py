@@ -278,14 +278,17 @@ def update_revenue_tab(
     for row_no, code in rows:
         data = rev_map.get(code)
         # Only write when this code truly has the same month as header month.
+        # Keep YoY%/MoM% as formulas so they auto-recover when data appears.
+        yoy_formula = f'=IFERROR(IF(OR(C{row_no}="",D{row_no}="",C{row_no}="N/A",D{row_no}="N/A"),"N/A",C{row_no}/D{row_no}-1),"N/A")'
+        mom_formula = f'=IFERROR(IF(OR(C{row_no}="",F{row_no}="",C{row_no}="N/A",F{row_no}="N/A"),"N/A",C{row_no}/F{row_no}-1),"N/A")'
+        updates.append((f"{tab_q}!E{row_no}", [[yoy_formula]]))
+        updates.append((f"{tab_q}!G{row_no}", [[mom_formula]]))
+
         if not data:
             missing.append(code)
             # Current month is unavailable -> mark C as N/A.
             # Keep D/F untouched to preserve previously known values.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
-            # Avoid formula errors on YoY%/MoM% when C is non-numeric.
-            updates.append((f"{tab_q}!E{row_no}", [["N/A"]]))
-            updates.append((f"{tab_q}!G{row_no}", [["N/A"]]))
             continue
 
         code_ym = data.get("ym")
@@ -294,9 +297,11 @@ def update_revenue_tab(
             # This code is not updated to header month yet.
             # Only mark current month as N/A; keep YoY-base / MoM-base columns intact.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
-            # Avoid formula errors on YoY%/MoM% when C is non-numeric.
-            updates.append((f"{tab_q}!E{row_no}", [["N/A"]]))
-            updates.append((f"{tab_q}!G{row_no}", [["N/A"]]))
+            # Best-effort: if current source month is exactly the previous month header,
+            # fill F with that value so MoM base remains usable.
+            prev_ym = ym_add(use_y, use_m, -1)
+            if code_ym == prev_ym and data.get("this") is not None:
+                updates.append((f"{tab_q}!F{row_no}", [[data.get("this")]]))
             continue
 
         updates.append((f"{tab_q}!C{row_no}", [[data.get("this")]]))
