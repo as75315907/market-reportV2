@@ -32,8 +32,9 @@ def fetch_hk_stock_map(hk_tickers: list[str], *, hist_one, last_two) -> dict:
     return stock_map
 
 
-def build_tw_stock_updates(tab_q: str, tw_rows: list[tuple[int, str]], tw_today_map: dict, tw_prev_map: dict, *, round_price) -> list[tuple[str, list[list]]]:
+def build_tw_stock_updates(tab_q: str, tw_rows: list[tuple[int, str]], tw_today_map: dict, tw_prev_map: dict, *, round_price) -> tuple[list[tuple[str, list[list]]], list[str]]:
     updates: list[tuple[str, list[list]]] = []
+    missing_volume_codes: list[str] = []
     for row_no, code in tw_rows:
         today_data = tw_today_map.get(code, {})
         prev_data = tw_prev_map.get(code, {})
@@ -50,6 +51,16 @@ def build_tw_stock_updates(tab_q: str, tw_rows: list[tuple[int, str]], tw_today_
                 lots = int(round(float(volume) / 1000.0))
             except Exception:
                 lots = None
+        else:
+            # 台股成交量缺失：明確寫 N/A 並記錄清單
+            lots = "N/A"
+            missing_volume_codes.append(code)
+
+        # 無成交日：成交張數應為 0，且開高低以 0 呈現（避免沿用外部來源殘值）
+        if lots == 0:
+            open_price = 0
+            low = 0
+            high = 0
 
         updates.extend(
             [
@@ -61,7 +72,7 @@ def build_tw_stock_updates(tab_q: str, tw_rows: list[tuple[int, str]], tw_today_
                 (f"{tab_q}!K{row_no}", [[lots]]),
             ]
         )
-    return updates
+    return updates, missing_volume_codes
 
 
 def build_hk_stock_updates(

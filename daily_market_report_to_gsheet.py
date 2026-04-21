@@ -376,15 +376,14 @@ def main():
     updates.append((f"{tab_q}!H8", [[hk_today_yi]]))
     updates.append((f"{tab_q}!I8", [[hk_prev_yi]]))
 
-    updates.extend(
-        build_tw_stock_updates(
-            tab_q,
-            tw_rows,
-            tw_today_map,
-            tw_prev_map,
-            round_price=_round2,
-        )
+    tw_updates, tw_missing_volume_codes = build_tw_stock_updates(
+        tab_q,
+        tw_rows,
+        tw_today_map,
+        tw_prev_map,
+        round_price=_round2,
     )
+    updates.extend(tw_updates)
     updates.extend(
         build_hk_stock_updates(
             tab_q,
@@ -418,6 +417,10 @@ def main():
     print(f"TWII turnover (today/prev, 億元): {tw_today_yi} / {tw_prev_yi}")
     print(f"HK turnover (today/prev, 億港幣): {hk_today_yi} / {hk_prev_yi}")
     print(f"first_run={first_run}")
+    if tw_missing_volume_codes:
+        print(f"台股成交量缺失清單：{','.join(tw_missing_volume_codes)}")
+    else:
+        print("台股成交量缺失清單：無")
 
 
 if __name__ == "__main__":
