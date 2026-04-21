@@ -192,3 +192,13 @@ If dedup skips the run, expected output includes:
 - Use `.venv` for all Python commands
 - Load `.env` via `python-dotenv`
 - Run tests after code changes
+
+## 防呆回歸規則（2026-04-21 起）
+
+- 前一交易日判定以 TWSE `MI_INDEX` 報價可用性為主，不可以 `FMTQIK` 成交值作主判定。
+- 台股成交量（K欄）只採官方來源（TWSE/TPEx）；官方缺失時寫 `N/A`，不得用 yfinance 補成交量。
+- 通知內容必須包含繁體中文缺失清單：`台股成交量缺失清單：...`。
+- 每次調整後需 `FORCE_RUN=1` 實跑並確認：
+  - `TW dates` 沒有跳過有效交易日。
+  - 代表性股票（如 2903）成交量與官方一致。
+  - 缺失清單輸出與表內 `N/A` 一致。
