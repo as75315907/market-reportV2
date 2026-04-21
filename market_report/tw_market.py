@@ -324,7 +324,9 @@ def tw_price_pack_for_codes(
                         "high": float(tr.get("High")) if pd.notna(tr.get("High")) else None,
                         "low": float(tr.get("Low")) if pd.notna(tr.get("Low")) else None,
                         "close": float(tr.get("Close")) if pd.notna(tr.get("Close")) else None,
-                        "volume": float(tr.get("Volume")) if pd.notna(tr.get("Volume")) else None,
+                        # 成交量以 TWSE/TPEx 官方來源為準；yfinance fallback 不回填 volume，
+                        # 避免與官方股數有誤差（例如 2903 出現 3199 張 vs 官方 3205 張）
+                        "volume": None,
                     }
 
                 if code not in prev_map:
