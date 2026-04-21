@@ -34,7 +34,7 @@ from market_report.quote_updates import build_hk_stock_updates, build_tw_stock_u
 from market_report.revenue import update_revenue_tab
 from market_report.sheet_exports import get_sheet_properties, hide_column_a
 from market_report.sheet_layout import find_stock_rows_from_sheet
-from market_report.tw_market import tw_price_pack_for_codes, twse_turnover_yi
+from market_report.tw_market import tw_price_pack_for_codes, twse_turnover_yi, fetch_mi_index, parse_mi_index_map
 
 
 # ========= Basic =========
@@ -128,25 +128,43 @@ def _today_taipei() -> datetime:
 
 def _resolve_tw_trade_dates(session, fallback_today: datetime) -> tuple[datetime, datetime]:
     """
-    Resolve TW market today/prev trade dates from TWSE turnover endpoint instead of ^TWII yfinance.
-    This avoids missing-day issues when index data has gaps and accidentally skips a trade date.
+    Resolve TW market today/prev trade dates from TWSE MI_INDEX quote availability.
+    Using turnover (FMTQIK) to infer trade dates can skip a valid prior trading day when
+    turnover endpoint is temporarily missing data for that date.
     """
-    # scan backward and collect first 2 dates with valid TWSE turnover
+    # scan backward and collect first 2 dates with valid TWSE quote data
     found: list[datetime] = []
     base = fallback_today
+    for back in range(0, 14):
+        dt = base - timedelta(days=back)
+        try:
+            mi = fetch_mi_index(session, dt)
+            mi_map = parse_mi_index_map(mi, to_float=_to_float)
+            if not mi_map:
+                continue
+            found.append(dt)
+            if len(found) >= 2:
+                break
+        except Exception:
+            continue
+
+    if len(found) >= 2:
+        return found[0], found[1]
+
+    # fallback 1: turnover-based inference
+    found_turnover: list[datetime] = []
     for back in range(0, 14):
         dt = base - timedelta(days=back)
         yi = twse_turnover_yi(session, dt)
         if yi is None:
             continue
-        found.append(dt)
-        if len(found) >= 2:
+        found_turnover.append(dt)
+        if len(found_turnover) >= 2:
             break
+    if len(found_turnover) >= 2:
+        return found_turnover[0], found_turnover[1]
 
-    if len(found) >= 2:
-        return found[0], found[1]
-
-    # fallback to original behavior if endpoint is unavailable
+    # fallback 2: simple yesterday
     return fallback_today, fallback_today - timedelta(days=1)
 
 def _parse_sheet_datetime(date_value, time_value=None) -> datetime | None:
