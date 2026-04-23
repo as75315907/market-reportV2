@@ -19,6 +19,7 @@ TWSE_FMTQIK = "https://www.twse.com.tw/exchangeReport/FMTQIK"
 TWSE_MI_INDEX = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
 TPEX_ST43 = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
 TPEX_OPENAPI_DAILY_CLOSE_QUOTES = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+TPEX_OPENAPI_ESB_LATEST_STATISTICS = "https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics"
 
 
 def ad_to_twse_date_str(dt: datetime) -> str:
@@ -184,6 +185,32 @@ def parse_tpex_openapi_map(rows: list[dict], date_dt: datetime, *, to_float) -> 
     return out
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def fetch_tpex_openapi_esb_latest_statistics(session) -> list[dict]:
+    response = session.get(TPEX_OPENAPI_ESB_LATEST_STATISTICS, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def parse_tpex_esb_volume_map(rows: list[dict], *, to_float) -> dict:
+    """Parse ESB latest statistics into {code: {'volume': shares}}."""
+    out: dict = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("SecuritiesCompanyCode", "")).strip()
+        if not code.isdigit():
+            continue
+        vol = to_float(row.get("TransactionVolume"))
+        if vol is None:
+            continue
+        out[code] = {"volume": vol}
+    return out
+
+
 def parse_tpex_st43(obj: dict, *, to_float) -> dict | None:
     """
     TPEx st43_result.php (個股日成交資訊) 常見欄位順序：
@@ -253,8 +280,14 @@ def tw_price_pack_for_codes(
     except Exception:
         openapi_rows = []
 
+    try:
+        esb_rows = fetch_tpex_openapi_esb_latest_statistics(session)
+    except Exception:
+        esb_rows = []
+
     openapi_today_map = parse_tpex_openapi_map(openapi_rows, t_date, to_float=to_float)
     openapi_prev_map = parse_tpex_openapi_map(openapi_rows, p_date, to_float=to_float)
+    esb_volume_map = parse_tpex_esb_volume_map(esb_rows, to_float=to_float)
 
     for code in codes:
         if code in openapi_today_map or code in openapi_prev_map:
@@ -263,6 +296,15 @@ def tw_price_pack_for_codes(
             today_map[code] = openapi_today_map[code]
         if code not in prev_map and code in openapi_prev_map:
             prev_map[code] = {"close": openapi_prev_map[code].get("close")}
+
+    # ESB volume補值（只補成交量，不覆蓋既有官方主板價格欄位）
+    for code in codes:
+        esb = esb_volume_map.get(code)
+        if not esb:
+            continue
+        target = today_map.setdefault(code, {})
+        if target.get("volume") is None:
+            target["volume"] = esb.get("volume")
 
     for code in codes:
         if code not in today_map:
