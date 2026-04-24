@@ -211,6 +211,36 @@ def parse_tpex_esb_volume_map(rows: list[dict], *, to_float) -> dict:
     return out
 
 
+def parse_tpex_esb_quote_map(rows: list[dict], date_dt: datetime, *, to_float) -> dict:
+    """
+    Parse ESB latest statistics into:
+    {code: {'open','high','low','close','volume','prev_close'}}
+
+    Note:
+    - ESB latest endpoint沒有當日開盤欄位，open 以 None 表示。
+    - prev_close 使用 PreviousAveragePrice（前一交易日均價）作為前日參考值。
+    """
+    out: dict = {}
+    target = roc_compact_date_str(date_dt)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("Date", "")).strip() != target:
+            continue
+        code = str(row.get("SecuritiesCompanyCode", "")).strip()
+        if not code.isdigit():
+            continue
+        out[code] = {
+            "open": None,
+            "high": to_float(row.get("Highest")),
+            "low": to_float(row.get("Lowest")),
+            "close": to_float(row.get("LatestPrice")),
+            "volume": to_float(row.get("TransactionVolume")),
+            "prev_close": to_float(row.get("PreviousAveragePrice")),
+        }
+    return out
+
+
 def parse_tpex_st43(obj: dict, *, to_float) -> dict | None:
     """
     TPEx st43_result.php (個股日成交資訊) 常見欄位順序：
@@ -263,6 +293,8 @@ def tw_price_pack_for_codes(
     tpex_strict_codes = {"2926", "5903", "5904", "1259", "2729", "8044", "8477", "6741"}
     # 自動偵測為上櫃來源的代號，會優先 TWO 後綴
     tpex_detected_codes: set[str] = set()
+    # 指定使用 ESB 官方來源的興櫃代號
+    esb_strict_codes = {"2942", "2758"}
 
     try:
         today_map = parse_mi_index_map(fetch_mi_index(session, t_date), to_float=to_float)
@@ -288,6 +320,7 @@ def tw_price_pack_for_codes(
     openapi_today_map = parse_tpex_openapi_map(openapi_rows, t_date, to_float=to_float)
     openapi_prev_map = parse_tpex_openapi_map(openapi_rows, p_date, to_float=to_float)
     esb_volume_map = parse_tpex_esb_volume_map(esb_rows, to_float=to_float)
+    esb_quote_map = parse_tpex_esb_quote_map(esb_rows, t_date, to_float=to_float)
 
     for code in codes:
         if code in openapi_today_map or code in openapi_prev_map:
@@ -305,6 +338,23 @@ def tw_price_pack_for_codes(
         target = today_map.setdefault(code, {})
         if target.get("volume") is None:
             target["volume"] = esb.get("volume")
+
+    # 指定興櫃代號：強制改採 ESB 官方來源（今日價量 + 前日參考收盤）
+    for code in (set(codes) & esb_strict_codes):
+        esbq = esb_quote_map.get(code)
+        if not esbq:
+            continue
+        tpex_detected_codes.add(code)
+        today_map[code] = {
+            "open": esbq.get("open"),
+            "high": esbq.get("high"),
+            "low": esbq.get("low"),
+            "close": esbq.get("close"),
+            "volume": esbq.get("volume"),
+        }
+        prev_close = esbq.get("prev_close")
+        if prev_close is not None:
+            prev_map[code] = {"close": prev_close}
 
     for code in codes:
         if code not in today_map:
