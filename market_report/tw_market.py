@@ -356,6 +356,30 @@ def tw_price_pack_for_codes(
         if prev_close is not None:
             prev_map[code] = {"close": prev_close}
 
+        # 興櫃開盤價：官方 ESB 無開盤欄位，僅此欄位改抓 finance API（當日對齊）
+        if today_map[code].get("open") is None:
+            t_key = pd.Timestamp(t_date.date())
+            for suffix in ("TWO", "TW"):
+                ticker = f"{code}.{suffix}"
+                try:
+                    history = hist_one(ticker)
+                    if history is None or history.empty or "Open" not in history.columns:
+                        continue
+                    h = history.copy()
+                    idx = h.index
+                    if getattr(idx, "tz", None) is not None:
+                        idx = idx.tz_localize(None)
+                    h.index = pd.to_datetime(idx).normalize()
+                    t_row = h.loc[h.index == t_key]
+                    if t_row.empty:
+                        continue
+                    tr = t_row.iloc[-1]
+                    if pd.notna(tr.get("Open")):
+                        today_map[code]["open"] = float(tr.get("Open"))
+                        break
+                except Exception:
+                    continue
+
     for code in codes:
         if code not in today_map:
             try:
