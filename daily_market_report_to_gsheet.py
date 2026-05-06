@@ -27,7 +27,8 @@ from io import StringIO
 import pandas as pd
 import requests
 import yfinance as yf
-from tenacity import retry, stop_after_attempt, wait_exponential
+from googleapiclient.errors import HttpError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from market_report.hk_market import hk_hands_from_aastocks, hk_turnover_scan_prev, hk_turnover_two_days
 from market_report.quote_updates import build_hk_stock_updates, build_tw_stock_updates, fetch_hk_stock_map
@@ -78,16 +79,32 @@ def gsheet_service():
     return svc, sheet_id, tab
 
 
+def _is_retryable_sheet_error(exc: Exception) -> bool:
+    if not isinstance(exc, HttpError):
+        return False
+    return int(getattr(exc.resp, "status", 0)) in {429, 500, 503}
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    retry=retry_if_exception(_is_retryable_sheet_error),
+    reraise=True,
+)
+def _execute_with_retry(req):
+    return req.execute()
+
+
 def batch_update_values(svc, sheet_id: str, updates: list[tuple[str, list[list]]], value_input="USER_ENTERED"):
     body = {
         "valueInputOption": value_input,
         "data": [{"range": rng, "values": vals} for rng, vals in updates],
     }
-    svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body=body).execute()
+    _execute_with_retry(svc.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body=body))
 
 
 def get_values(svc, sheet_id: str, rng: str) -> list[list]:
-    res = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+    res = _execute_with_retry(svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng))
     return res.get("values", [])
 
 
