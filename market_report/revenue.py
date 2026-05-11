@@ -236,20 +236,30 @@ def update_revenue_tab(
     exp_y, exp_m = ym_add(now.year, now.month, -1)
     dataset_ym, rev_map = fetch_monthly_revenue_maps_all(session, user_agent, to_float)
 
-    # Fallback: if open data not updated to expected month yet, query MOPS company page per code.
-    # This is slower but helps bridge the release lag for the tracked code list.
+    # Fallback: per-code MOPS company query when a tracked code is missing/stale for expected month.
+    # Do NOT gate only by dataset_ym, because open data can be partially missing by code.
     enable_fallback = os.getenv("REVENUE_ENABLE_MOPS_FALLBACK", "1").strip() == "1"
     expected_ym = (exp_y, exp_m)
-    if enable_fallback and rows and (dataset_ym is None or dataset_ym < expected_ym):
+    if enable_fallback and rows:
         previous_month_map = {code: (rev_map.get(code, {}) or {}).get("this") for _, code in rows}
-        fetched = 0
+        fallback_needed_codes: list[str] = []
+        fallback_ok_codes: list[str] = []
+        fallback_fail_codes: list[str] = []
+
         for _, code in rows:
+            data = rev_map.get(code) or {}
+            if data.get("ym") != expected_ym or data.get("this") is None or data.get("last_year") is None:
+                fallback_needed_codes.append(code)
+
+        for code in fallback_needed_codes:
             try:
                 mops = fetch_company_month_revenue_mops(session, user_agent, code, exp_y, exp_m, to_float)
             except Exception:
                 mops = None
             if not mops:
+                fallback_fail_codes.append(code)
                 continue
+
             rev_map.setdefault(code, {})
             rev_map[code]["this"] = mops.get("this")
             rev_map[code]["last_year"] = mops.get("last_year")
@@ -257,11 +267,19 @@ def update_revenue_tab(
             # MOPS company page doesn't provide previous month directly; use open-data "this" as proxy.
             if previous_month_map.get(code) is not None:
                 rev_map[code]["last_month"] = previous_month_map.get(code)
-            fetched += 1
+            fallback_ok_codes.append(code)
 
-        if fetched > 0:
+        if fallback_ok_codes:
             dataset_ym = expected_ym
-            print(f"Revenue fallback used: MOPS company query | month={exp_y}-{exp_m:02d} | fetched={fetched}")
+        if fallback_needed_codes:
+            print(
+                f"Revenue fallback summary | month={exp_y}-{exp_m:02d} | "
+                f"needed={len(fallback_needed_codes)} ok={len(fallback_ok_codes)} fail={len(fallback_fail_codes)}"
+            )
+            if fallback_ok_codes:
+                print("Revenue fallback ok codes:", ", ".join(fallback_ok_codes))
+            if fallback_fail_codes:
+                print("Revenue fallback failed codes:", ", ".join(fallback_fail_codes))
 
     use_y, use_m = dataset_ym if dataset_ym else (exp_y, exp_m)
     y_ly, m_ly = use_y - 1, use_m
