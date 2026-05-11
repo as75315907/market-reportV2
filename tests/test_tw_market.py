@@ -26,7 +26,7 @@ class TwMarketTests(unittest.TestCase):
         self.assertEqual(result["2330"]["volume"], 1000.0)
 
     def test_parse_tpex_st43(self):
-        payload = {"aaData": [["2330", "", "10.5", "", "10.0", "11.0", "9.5", "5,000"]]}
+        payload = {"aaData": [["115/03/06", "5,000", "100", "10.0", "11.0", "9.5", "10.5", "+0.5", "88"]]}
         result = parse_tpex_st43(payload, to_float=lambda v: float(str(v).replace(",", "")))
         self.assertEqual(result["close"], 10.5)
         self.assertEqual(result["volume"], 5000.0)

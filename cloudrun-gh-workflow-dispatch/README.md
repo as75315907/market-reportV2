@@ -33,16 +33,18 @@ curl -s -X POST https://<YOUR_CLOUD_RUN_URL>/dispatch \
 {"ok": true, "status": 204}
 ```
 
-## 建 Cloud Scheduler Job（台北 17:00）
+## 建 Cloud Scheduler Job（台北 17:30）
 - Target: HTTP
 - URL: `https://<YOUR_CLOUD_RUN_URL>/dispatch`
 - Method: POST
 - Time zone: `Asia/Taipei`
-- Schedule: `0 17 * * 1-5`
+- Daily stock price schedule: `30 17 * * 1-5`
+- Monthly revenue schedule: `30 17 10 * *`
 - Headers:
   - `X-CRON-SECRET: 你設定的CRON_SECRET`
   - `Content-Type: application/json`
-- Body: `{"inputs":{}}`（若 workflow 有 inputs 才需要）
+- Daily stock price body: `{"inputs":{"target":"quotes"}}`
+- Monthly revenue body: `{"inputs":{"target":"revenue"}}`
 
 ## GitHub Token（PAT）建議權限
 - repo（private repo 需要）

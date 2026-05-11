@@ -304,17 +304,19 @@ def update_revenue_tab(
 
         if not data:
             missing.append(code)
-            # Current month is unavailable -> mark C as N/A.
-            # Keep D/F untouched to preserve previously known values.
+            # Current month is unavailable -> mark current and YoY base as N/A.
+            # Keep F untouched to preserve the previous-month base value.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!D{row_no}", [["N/A"]]))
             continue
 
         code_ym = data.get("ym")
         if code_ym != (use_y, use_m):
             stale.append(code)
             # This code is not updated to header month yet.
-            # Only mark current month as N/A; keep YoY-base / MoM-base columns intact.
+            # Mark current month and YoY-base as N/A; keep MoM-base intact.
             updates.append((f"{tab_q}!C{row_no}", [["N/A"]]))
+            updates.append((f"{tab_q}!D{row_no}", [["N/A"]]))
             # Best-effort: if current source month is exactly the previous month header,
             # fill F with that value so MoM base remains usable.
             prev_ym = ym_add(use_y, use_m, -1)
@@ -322,8 +324,8 @@ def update_revenue_tab(
                 updates.append((f"{tab_q}!F{row_no}", [[data.get("this")]]))
             continue
 
-        updates.append((f"{tab_q}!C{row_no}", [[data.get("this")]]))
-        updates.append((f"{tab_q}!D{row_no}", [[data.get("last_year")]]))
+        updates.append((f"{tab_q}!C{row_no}", [[data.get("this") if data.get("this") is not None else "N/A"]]))
+        updates.append((f"{tab_q}!D{row_no}", [[data.get("last_year") if data.get("last_year") is not None else "N/A"]]))
         updates.append((f"{tab_q}!F{row_no}", [[data.get("last_month")]]))
 
     if updates:

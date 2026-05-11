@@ -449,19 +449,6 @@ def tw_price_pack_for_codes(
                     if not p_row.empty:
                         pr = p_row.iloc[-1]
                         prev_map[code] = {"close": float(pr.get("Close")) if pd.notna(pr.get("Close")) else None}
-                    else:
-                        # 指定前日缺值時，取「<= p_date 的最近一筆」而非直接用今日收盤，
-                        # 避免把 prev_close 錯寫成今日 close。
-                        older = h.loc[h.index <= p_key]
-                        if not older.empty:
-                            pr = older.iloc[-1]
-                            prev_map[code] = {
-                                "close": float(pr.get("Close")) if pd.notna(pr.get("Close")) else None
-                            }
-                        else:
-                            t_close = today_map.get(code, {}).get("close") if isinstance(today_map.get(code), dict) else None
-                            if t_close is not None:
-                                prev_map[code] = {"close": t_close}
                 break
             except Exception:
                 continue
@@ -488,10 +475,7 @@ def tw_price_pack_for_codes(
                 p_key = pd.Timestamp(p_date.date())
                 p_row = h.loc[h.index == p_key]
                 if p_row.empty:
-                    older = h.loc[h.index <= p_key]
-                    if older.empty:
-                        continue
-                    pr = older.iloc[-1]
+                    continue
                 else:
                     pr = p_row.iloc[-1]
                 if pd.notna(pr.get("Close")):

@@ -1,8 +1,18 @@
-name: Market Report to Google Sheet (Mon-Fri by 17:00 Taipei)
+name: Market Report to Google Sheet
 
 on:
   
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Update target"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - quotes
+          - revenue
 
 permissions:
   contents: read
@@ -21,6 +31,7 @@ jobs:
       GSHEET_ID: ${{ secrets.GSHEET_ID }}
       GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
       GSHEET_SHEET_NAME: ${{ secrets.GSHEET_SHEET_NAME || 'IR_updated (PC HOME)' }}
+      MARKET_REPORT_TASK: ${{ inputs.target || 'all' }}
 
     steps:
       - name: Checkout
@@ -63,6 +74,7 @@ jobs:
           print(info("GSHEET_ID"))
           print(info("GSHEET_TAB"))
           print(info("GSHEET_SHEET_NAME"))
+          print(info("MARKET_REPORT_TASK"))
           print(info("GCP_PROJECT_ID"))
           PY
 

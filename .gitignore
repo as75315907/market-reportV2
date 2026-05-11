@@ -1,5 +1,6 @@
 .env
 .env.*
+.venv/
 logs/
 debug/
 reports/

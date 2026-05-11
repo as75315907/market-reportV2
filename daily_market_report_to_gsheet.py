@@ -143,16 +143,22 @@ def _today_taipei() -> datetime:
     return datetime.now()
 
 
-def _resolve_tw_trade_dates(session, fallback_today: datetime) -> tuple[datetime, datetime]:
-    """
-    Resolve TW market today/prev trade dates from TWSE MI_INDEX quote availability.
-    Using turnover (FMTQIK) to infer trade dates can skip a valid prior trading day when
-    turnover endpoint is temporarily missing data for that date.
-    """
-    # scan backward and collect first 2 dates with valid TWSE quote data
+def _scan_tw_turnover_trade_dates(session, base: datetime, max_back_days: int = 14) -> list[datetime]:
     found: list[datetime] = []
-    base = fallback_today
-    for back in range(0, 14):
+    for back in range(0, max_back_days):
+        dt = base - timedelta(days=back)
+        yi = twse_turnover_yi(session, dt)
+        if yi is None:
+            continue
+        found.append(dt)
+        if len(found) >= 2:
+            break
+    return found
+
+
+def _scan_tw_quote_trade_dates(session, base: datetime, max_back_days: int = 14) -> list[datetime]:
+    found: list[datetime] = []
+    for back in range(0, max_back_days):
         dt = base - timedelta(days=back)
         try:
             mi = fetch_mi_index(session, dt)
@@ -164,25 +170,50 @@ def _resolve_tw_trade_dates(session, fallback_today: datetime) -> tuple[datetime
                 break
         except Exception:
             continue
+    return found
 
-    if len(found) >= 2:
-        return found[0], found[1]
 
-    # fallback 1: turnover-based inference
-    found_turnover: list[datetime] = []
-    for back in range(0, 14):
-        dt = base - timedelta(days=back)
-        yi = twse_turnover_yi(session, dt)
-        if yi is None:
-            continue
-        found_turnover.append(dt)
-        if len(found_turnover) >= 2:
-            break
-    if len(found_turnover) >= 2:
-        return found_turnover[0], found_turnover[1]
+def _resolve_tw_trade_dates(session, fallback_today: datetime) -> tuple[datetime, datetime]:
+    """
+    Resolve TW market today/prev trade dates with strict cross-source validation.
 
-    # fallback 2: simple yesterday
-    return fallback_today, fallback_today - timedelta(days=1)
+    FMTQIK is the canonical source for TWSE market turnover dates. If the quote
+    source disagrees with FMTQIK, abort instead of silently falling back to an
+    older date.
+    """
+    base = fallback_today
+    turnover_dates = _scan_tw_turnover_trade_dates(session, base)
+    quote_dates = _scan_tw_quote_trade_dates(session, base)
+
+    if len(turnover_dates) < 2:
+        raise RuntimeError(
+            "TW date guard failed: cannot resolve two TWSE turnover dates from FMTQIK; skip writing quotes"
+        )
+
+    t_date, p_date = turnover_dates[0], turnover_dates[1]
+
+    # On scheduled weekday runs, do not use an older date as "today" just because
+    # the API is late or stale.
+    if t_date.date() != base.date() and os.getenv("ALLOW_STALE_MARKET_DATE", "0").strip() != "1":
+        raise RuntimeError(
+            f"TW date guard failed: latest turnover date is {t_date.date()}, "
+            f"but run date is {base.date()}; skip writing quotes"
+        )
+
+    if quote_dates:
+        quote_today = quote_dates[0]
+        if quote_today.date() != t_date.date():
+            raise RuntimeError(
+                f"TW date guard failed: quote date {quote_today.date()} != turnover date {t_date.date()}; "
+                "skip writing quotes"
+            )
+        if len(quote_dates) >= 2 and quote_dates[1].date() != p_date.date():
+            raise RuntimeError(
+                f"TW date guard failed: quote prev date {quote_dates[1].date()} != turnover prev date {p_date.date()}; "
+                "skip writing quotes"
+            )
+
+    return t_date, p_date
 
 def _parse_sheet_datetime(date_value, time_value=None) -> datetime | None:
     """解析 L3/M3 的更新時間；相容舊格式 L3 單格日期時間。"""
@@ -273,6 +304,76 @@ def last_two(series: pd.Series):
     return s.index[-1], float(s.iloc[-1]), s.index[-2], float(s.iloc[-2])
 
 
+def _normalize_history_index(history: pd.DataFrame) -> pd.DataFrame:
+    h = history.copy()
+    idx = h.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    h.index = pd.to_datetime(idx).normalize()
+    return h
+
+
+def _index_pack_for_dates(ticker: str, today_dt: datetime, prev_dt: datetime) -> dict:
+    try:
+        history = hist_one(ticker)
+    except Exception:
+        return {}
+    if history is None or history.empty or "Close" not in history.columns:
+        return {}
+
+    h = _normalize_history_index(history)
+    t_key = pd.Timestamp(today_dt.date())
+    p_key = pd.Timestamp(prev_dt.date())
+    t_row = h.loc[h.index == t_key]
+    p_row = h.loc[h.index == p_key]
+    if t_row.empty or p_row.empty:
+        return {}
+
+    t = t_row.iloc[-1]
+    p = p_row.iloc[-1]
+    if pd.isna(t.get("Close")) or pd.isna(p.get("Close")):
+        return {}
+
+    return {
+        "t_date": t_key,
+        "p_date": p_key,
+        "close": float(t.get("Close")),
+        "prev_close": float(p.get("Close")),
+    }
+
+
+def _latest_index_pack_strict(ticker: str, run_dt: datetime, label: str) -> dict:
+    try:
+        history = hist_one(ticker)
+    except Exception:
+        return {}
+    if history is None or history.empty or "Close" not in history.columns or history["Close"].dropna().shape[0] < 2:
+        return {}
+
+    h = _normalize_history_index(history)
+    h = h[h["Close"].notna()]
+    if len(h) < 2:
+        return {}
+
+    today = h.iloc[-1]
+    prev = h.iloc[-2]
+    today_key = h.index[-1]
+    prev_key = h.index[-2]
+
+    if today_key.date() != run_dt.date() and os.getenv("ALLOW_STALE_MARKET_DATE", "0").strip() != "1":
+        raise RuntimeError(
+            f"{label} date guard failed: latest index date is {today_key.date()}, "
+            f"but run date is {run_dt.date()}; skip writing quotes"
+        )
+
+    return {
+        "t_date": today_key,
+        "p_date": prev_key,
+        "close": float(today.get("Close")),
+        "prev_close": float(prev.get("Close")),
+    }
+
+
 # ========= Sessions =========
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": UA})
@@ -281,16 +382,34 @@ _SESSION.headers.update({"User-Agent": UA})
 # ========= Main =========
 TICKER_TWII = "^TWII"
 TICKER_HSI  = "^HSI"
+VALID_REPORT_TASKS = {"all", "quotes", "revenue"}
+REPORT_TASK_ALIASES = {
+    "quote": "quotes",
+    "price": "quotes",
+    "prices": "quotes",
+    "stock": "quotes",
+    "stocks": "quotes",
+    "daily": "quotes",
+    "monthly": "revenue",
+    "rev": "revenue",
+}
 
-def main():
-    svc, sheet_id, tab = gsheet_service()
-  
-    # ---- Dedup: skip if already updated today ----
-    if should_skip_today_by_l3(svc, sheet_id, tab):
-        # 告訴 workflow 這次是 skip（避免寄信）
-        Path("skipped.txt").write_text("1", encoding="utf-8")
-        print("[DEDUP] skipped.txt written. Exit 0.")
-        return
+
+def _resolve_report_task() -> str:
+    raw = (
+        os.getenv("MARKET_REPORT_TASK")
+        or os.getenv("REPORT_TASK")
+        or os.getenv("UPDATE_TARGET")
+        or "all"
+    )
+    task = REPORT_TASK_ALIASES.get(raw.strip().lower(), raw.strip().lower())
+    if task not in VALID_REPORT_TASKS:
+        valid = ", ".join(sorted(VALID_REPORT_TASKS))
+        raise RuntimeError(f"Invalid MARKET_REPORT_TASK={raw!r}; expected one of: {valid}")
+    return task
+
+
+def _update_quotes_tab(svc, sheet_id: str, tab: str) -> None:
     tab_q = f"'{tab}'" if re.search(r"[^A-Za-z0-9_]", tab) else tab
     sheet_props = get_sheet_properties(svc, sheet_id, tab)
 
@@ -311,24 +430,18 @@ def main():
 
     tw_rows, hk_rows = find_stock_rows_from_sheet(col_a, col_b)
 
-    idx_map = {}
-    for tkr in (TICKER_TWII, TICKER_HSI):
-        try:
-            h = hist_one(tkr)
-        except Exception:
-            h = pd.DataFrame()
-        if h is None or h.empty or "Close" not in h.columns or h["Close"].dropna().shape[0] < 2:
-            idx_map[tkr] = {}
-            continue
-        t_date, t_close, p_date, p_close = last_two(h["Close"])
-        idx_map[tkr] = {"t_date": t_date, "p_date": p_date, "close": t_close, "prev_close": p_close}
-
-    twii = idx_map.get(TICKER_TWII, {})
-    hsi  = idx_map.get(TICKER_HSI, {})
-
     # TW trade dates: use TWSE official turnover availability first (more stable than ^TWII yfinance)
     now = _today_taipei()
     tw_t_dt, tw_p_dt = _resolve_tw_trade_dates(_SESSION, now)
+    twii = _index_pack_for_dates(TICKER_TWII, tw_t_dt, tw_p_dt)
+    hsi = _latest_index_pack_strict(TICKER_HSI, now, "HK HSI")
+    if not twii:
+        raise RuntimeError(
+            f"TW date guard failed: {TICKER_TWII} has no exact rows for "
+            f"{tw_t_dt.date()} / {tw_p_dt.date()}; skip writing quotes"
+        )
+    if not hsi:
+        raise RuntimeError("HK date guard failed: HSI has no valid latest/previous rows; skip writing quotes")
 
     # turnovers
     tw_today_yi = twse_turnover_yi(_SESSION, tw_t_dt)
@@ -371,11 +484,27 @@ def main():
         last_two=last_two,
         to_float=_to_float,
     )
+    tw_skipped_codes = [
+        code
+        for code in tw_codes
+        if not tw_today_map.get(code) or tw_today_map.get(code, {}).get("close") is None
+    ]
 
     # HK stocks via yfinance
     hk_codes = [code for _, code in hk_rows]
     hk_tickers = [f"{int(c):04d}.HK" for c in hk_codes]
-    hk_stock_map = fetch_hk_stock_map(hk_tickers, hist_one=hist_one, last_two=last_two)
+    hk_stock_map = fetch_hk_stock_map(
+        hk_tickers,
+        hist_one=hist_one,
+        last_two=last_two,
+        expected_today=hsi.get("t_date"),
+        expected_prev=hsi.get("p_date"),
+    )
+    hk_skipped_codes = [
+        code
+        for code, ticker in zip(hk_codes, hk_tickers)
+        if not hk_stock_map.get(ticker)
+    ]
 
     # build updates
     updates = []
@@ -416,7 +545,26 @@ def main():
     batch_update_values(svc, sheet_id, updates, value_input="USER_ENTERED")
     hide_column_a(svc, sheet_id, sheet_props["sheetId"])
 
-    # NEW: update Revenue tab
+    print(f"TW rows: {len(tw_rows)} | HK rows: {len(hk_rows)}")
+    print(f"TW dates: {tw_t_dt.date()} / {tw_p_dt.date()}")
+    print(f"TWII turnover (today/prev, 億元): {tw_today_yi} / {tw_prev_yi}")
+    print(f"HK turnover (today/prev, 億港幣): {hk_today_yi} / {hk_prev_yi}")
+    print(f"first_run={first_run}")
+    if hk_skipped_codes:
+        print(f"港股因日期或資料缺失略過清單：{','.join(hk_skipped_codes)}")
+    else:
+        print("港股因日期或資料缺失略過清單：無")
+    if tw_skipped_codes:
+        print(f"台股因日期或資料缺失略過清單：{','.join(tw_skipped_codes)}")
+    else:
+        print("台股因日期或資料缺失略過清單：無")
+    if tw_missing_volume_codes:
+        print(f"台股成交量缺失清單：{','.join(tw_missing_volume_codes)}")
+    else:
+        print("台股成交量缺失清單：無")
+
+
+def _update_revenue_only(svc, sheet_id: str) -> None:
     update_revenue_tab(
         svc,
         sheet_id,
@@ -428,16 +576,32 @@ def main():
         to_float=_to_float,
     )
 
-    print("DONE: updated Google Sheet")
-    print(f"TW rows: {len(tw_rows)} | HK rows: {len(hk_rows)}")
-    print(f"TW dates: {tw_t_dt.date()} / {tw_p_dt.date()}")
-    print(f"TWII turnover (today/prev, 億元): {tw_today_yi} / {tw_prev_yi}")
-    print(f"HK turnover (today/prev, 億港幣): {hk_today_yi} / {hk_prev_yi}")
-    print(f"first_run={first_run}")
-    if tw_missing_volume_codes:
-        print(f"台股成交量缺失清單：{','.join(tw_missing_volume_codes)}")
+
+def main():
+    task = _resolve_report_task()
+    print(f"[TASK] MARKET_REPORT_TASK={task}")
+
+    svc, sheet_id, tab = gsheet_service()
+
+    if task in {"all", "quotes"}:
+        # ---- Dedup: skip if already updated today ----
+        if should_skip_today_by_l3(svc, sheet_id, tab):
+            # 告訴 workflow 這次是 skip（避免寄信）
+            Path("skipped.txt").write_text("1", encoding="utf-8")
+            print("[DEDUP] skipped.txt written. Exit 0.")
+            return
+
+        _update_quotes_tab(svc, sheet_id, tab)
+
+    if task in {"all", "revenue"}:
+        _update_revenue_only(svc, sheet_id)
+
+    if task == "quotes":
+        print("DONE: updated quote sheet")
+    elif task == "revenue":
+        print("DONE: updated revenue sheet")
     else:
-        print("台股成交量缺失清單：無")
+        print("DONE: updated Google Sheet")
 
 
 if __name__ == "__main__":
