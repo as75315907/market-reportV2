@@ -3,7 +3,7 @@ import os
 import sys
 from google.cloud import storage
 
-from market_report.status_summary import parse_run_output
+from market_report.status_summary import build_notification_text, parse_run_output
 from market_report.time_utils import timestamp_taipei, today_taipei
 
 def main():
@@ -21,11 +21,14 @@ def main():
         text = f.read()
 
     summary = parse_run_output(text)
+    time_taipei = timestamp_taipei()
+    notification_text = build_notification_text(text, time_taipei=time_taipei)
     payload = {
-        "time_taipei": timestamp_taipei(),
+        "time_taipei": time_taipei,
         "result": summary.result,
         "skipped": summary.skipped,
         "last_updated_today": summary.last_updated,
+        "notification_text": notification_text,
         "log_tail": text[-4000:],
     }
 

@@ -5,7 +5,7 @@ import sys
 from flask import Flask, Response, request
 
 from market_report.mail import send_mail
-from market_report.status_summary import email_subject_for_result, parse_run_output
+from market_report.status_summary import build_notification_text, email_subject_for_result, parse_run_output
 from market_report.time_utils import timestamp_taipei
 
 app = Flask(__name__)
@@ -69,7 +69,7 @@ def run_job():
         print(out)
 
         subject = "⏱️Daily Market Report 執行逾時（timeout）"
-        body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
+        body = build_notification_text(out, time_taipei=timestamp_taipei(), include_log_tail=True)
         send_mail(subject, body)
 
         return Response(out, status=504, mimetype="text/plain")
@@ -87,12 +87,12 @@ def run_job():
 
         result = "skip" if skipped else "success"
         subject = email_subject_for_result(result)
-        body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
+        body = build_notification_text(out, time_taipei=timestamp_taipei())
         send_mail(subject, body)
         return Response(out, status=200, mimetype="text/plain")
 
     # failure
     subject = email_subject_for_result("fail")
-    body = f"Time(Taipei): {timestamp_taipei()}\n\n" + out[-4000:]
+    body = build_notification_text(out, time_taipei=timestamp_taipei(), include_log_tail=True)
     send_mail(subject, body)
     return Response(out, status=500, mimetype="text/plain")

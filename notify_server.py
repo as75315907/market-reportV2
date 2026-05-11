@@ -4,7 +4,7 @@ from flask import Flask, Response
 from google.cloud import storage
 
 from market_report.mail import send_mail
-from market_report.status_summary import email_subject_for_result
+from market_report.status_summary import build_notification_text, email_subject_for_result
 from market_report.time_utils import today_taipei, timestamp_taipei
 
 app = Flask(__name__)
@@ -31,6 +31,8 @@ def notify():
 
     summary = json.loads(blob.download_as_text())
     subject = email_subject_for_result(summary.get("result", "fail"))
-    body = f"Time(Taipei): {timestamp_taipei()}\n\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+    body = summary.get("notification_text")
+    if not body:
+        body = build_notification_text(summary.get("log_tail", ""), time_taipei=summary.get("time_taipei") or timestamp_taipei())
     send_mail(subject, body, strict=True)
     return Response("ok", status=200)
